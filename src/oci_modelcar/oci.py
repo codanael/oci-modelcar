@@ -15,6 +15,19 @@ from oci_modelcar.http import build_session, oci_auth_header
 log = logging.getLogger(__name__)
 
 ML_TAR = "application/vnd.oci.image.layer.v1.tar"
+
+
+def _is_loopback(host: str) -> bool:
+    """True if host is a loopback/local address (no TLS by default)."""
+    # IPv6 bare address (e.g. "::1") — no port stripping needed
+    if host == "::1" or host.startswith("["):
+        return host in ("::1", "[::1]")
+    h = host.split(":", 1)[0]
+    if h in ("localhost", "127.0.0.1"):
+        return True
+    return h.startswith("127.")
+
+
 ML_CFG = "application/vnd.oci.image.config.v1+json"
 ML_MAN = "application/vnd.oci.image.manifest.v1+json"
 
@@ -42,7 +55,14 @@ class OciClient:
         else:
             assert registry_host is not None
             self.host = registry_host
-            self.base = f"https://{registry_host}"
+            # Allow callers to encode scheme in registry_host (e.g. "http://localhost:5000")
+            if registry_host.startswith(("http://", "https://")):
+                self.base = registry_host.rstrip("/")
+                self.host = registry_host.split("//", 1)[-1]
+            elif _is_loopback(registry_host):
+                self.base = f"http://{registry_host}"
+            else:
+                self.base = f"https://{registry_host}"
         self.session = session if session is not None else build_session()
 
     @property

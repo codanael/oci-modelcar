@@ -4,7 +4,7 @@ import pytest
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
-from oci_modelcar.oci import OciClient, head_blob, push_small_blob
+from oci_modelcar.oci import OciClient, _is_loopback, head_blob, push_small_blob
 
 
 def _client(httpserver: HTTPServer) -> OciClient:
@@ -68,3 +68,30 @@ def test_head_blob_not_found(httpserver: HTTPServer):
     client = _client(httpserver)
     with pytest.raises(RuntimeError, match="not found"):
         head_blob(client, repo="repo", digest=digest)
+
+
+def test_oci_client_uses_http_for_localhost():
+    client = OciClient(registry_host="localhost:5000")
+    assert client.base == "http://localhost:5000"
+    assert client.host == "localhost:5000"
+
+
+def test_oci_client_uses_https_for_remote():
+    client = OciClient(registry_host="registry.example.com")
+    assert client.base == "https://registry.example.com"
+
+
+def test_oci_client_respects_explicit_scheme():
+    client = OciClient(registry_host="http://insecure.example.com:5000")
+    assert client.base == "http://insecure.example.com:5000"
+    client2 = OciClient(registry_host="https://secure.example.com")
+    assert client2.base == "https://secure.example.com"
+
+
+def test_oci_client_loopback_127():
+    assert _is_loopback("localhost:5000")
+    assert _is_loopback("127.0.0.1:5000")
+    assert _is_loopback("127.10.20.30")
+    assert _is_loopback("::1")
+    assert not _is_loopback("registry.example.com")
+    assert not _is_loopback("10.0.0.1")
