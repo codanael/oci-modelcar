@@ -1,0 +1,180 @@
+"""OCI Distribution v1.1 client: chunked blob upload, blob/manifest validation."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import random
+import time
+from dataclasses import dataclass
+
+import requests
+
+from oci_modelcar.http import build_session, oci_auth_header
+
+log = logging.getLogger(__name__)
+
+ML_TAR = "application/vnd.oci.image.layer.v1.tar"
+ML_CFG = "application/vnd.oci.image.config.v1+json"
+ML_MAN = "application/vnd.oci.image.manifest.v1+json"
+
+
+@dataclass(frozen=True, slots=True)
+class BlobDescriptor:
+    media_type: str
+    digest: str
+    size: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {"mediaType": self.media_type, "digest": self.digest, "size": self.size}
+
+
+class OciClient:
+    def __init__(
+        self,
+        host_url: str | None = None,
+        registry_host: str | None = None,
+        session: requests.Session | None = None,
+    ) -> None:
+        if host_url is not None:
+            self.base = host_url.rstrip("/")
+            self.host = self.base.split("//", 1)[-1]
+        else:
+            assert registry_host is not None
+            self.host = registry_host
+            self.base = f"https://{registry_host}"
+        self.session = session if session is not None else build_session()
+
+    @property
+    def auth(self) -> dict[str, str]:
+        return oci_auth_header(self.host)
+
+    def url(self, *parts: str) -> str:
+        return f"{self.base}/v2/" + "/".join(parts)
+
+
+class ChunkedBlobUpload:
+    """Streaming blob upload with PATCH chunks and PUT finalization.
+
+    Memory bound: ~2 * chunk_size.
+    Compliant with OCI Distribution v1.1: Content-Range is inclusive 'N-M'.
+    """
+
+    def __init__(
+        self,
+        client: OciClient,
+        repo: str,
+        chunk_size: int = 8 * 1024 * 1024,
+        max_retries: int = 10,
+        backoff_initial: float = 1.0,
+        backoff_cap: float = 60.0,
+    ) -> None:
+        self.client = client
+        self.repo = repo
+        self.chunk_size = chunk_size
+        self.max_retries = max_retries
+        self.backoff_initial = backoff_initial
+        self.backoff_cap = backoff_cap
+        self.h = hashlib.sha256()
+        self.buf = bytearray()
+        self.server_offset = 0
+        self.total = 0
+        self.location = self._begin()
+
+    def _begin(self) -> str:
+        url = self.client.url(self.repo, "blobs", "uploads") + "/"
+        r = self.client.session.post(url, headers=self.client.auth, timeout=60)
+        if r.status_code != 202:
+            r.raise_for_status()
+            raise RuntimeError(f"unexpected status {r.status_code} on upload init")
+        loc = r.headers.get("Location")
+        if not loc:
+            raise RuntimeError("upload init missing Location header")
+        return loc
+
+    def write(self, data: bytes) -> int:
+        n = len(data)
+        self.h.update(data)
+        self.buf.extend(data)
+        self.total += n
+        while len(self.buf) >= self.chunk_size:
+            self._flush(self.chunk_size)
+        return n
+
+    def _flush(self, size: int) -> None:
+        chunk = bytes(self.buf[:size])
+        del self.buf[:size]
+        self._patch_with_retry(chunk)
+
+    def _patch_with_retry(self, chunk: bytes) -> None:
+        start = self.server_offset
+        end = start + len(chunk) - 1
+        for attempt in range(self.max_retries):
+            try:
+                hdr = {
+                    **self.client.auth,
+                    "Content-Type": "application/octet-stream",
+                    "Content-Range": f"{start}-{end}",  # OCI: inclusive, no "bytes " prefix
+                    "Content-Length": str(len(chunk)),
+                }
+                r = self.client.session.patch(self.location, data=chunk, headers=hdr, timeout=600)
+                if r.status_code == 202:
+                    self.location = r.headers.get("Location", self.location)
+                    self.server_offset = end + 1
+                    return
+                if r.status_code == 416:
+                    log.warning("PATCH 416 at [%d-%d], resyncing", start, end)
+                    self._resync()
+                    if self.server_offset >= end + 1:
+                        return
+                    continue
+                r.raise_for_status()
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as e:
+                log.warning("PATCH failed [%d-%d] attempt %d: %s", start, end, attempt + 1, e)
+                self._sleep_backoff(attempt)
+                self._resync()
+                if self.server_offset >= end + 1:
+                    return
+        raise RuntimeError(f"PATCH retries exhausted at offset {start} (chunk [{start}-{end}])")
+
+    def _resync(self) -> None:
+        r = self.client.session.get(self.location, headers=self.client.auth, timeout=30)
+        if r.status_code != 204:
+            r.raise_for_status()
+        rng = r.headers.get("Range", "")
+        if rng:
+            try:
+                end = int(rng.split("-")[1])
+                self.server_offset = end + 1
+            except ValueError, IndexError:
+                self.server_offset = 0
+        else:
+            self.server_offset = 0
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        delay = min(self.backoff_cap, self.backoff_initial * (2**attempt))
+        delay += random.uniform(0, delay * 0.1)
+        if delay > 0:
+            time.sleep(delay)
+
+    def close(self) -> tuple[str, int]:
+        digest = "sha256:" + self.h.hexdigest()
+        sep = "&" if "?" in self.location else "?"
+        url = f"{self.location}{sep}digest={digest}"
+        if self.buf:
+            hdr = {
+                **self.client.auth,
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(self.buf)),
+            }
+            r = self.client.session.put(url, data=bytes(self.buf), headers=hdr, timeout=600)
+        else:
+            r = self.client.session.put(url, headers=self.client.auth, timeout=120)
+        if r.status_code != 201:
+            r.raise_for_status()
+            raise RuntimeError(f"unexpected status {r.status_code} on PUT close")
+        return digest, self.total
