@@ -25,7 +25,7 @@ def _supports_color(stream: IO[str]) -> bool:
         return False
     try:
         return stream.isatty()
-    except AttributeError, ValueError:
+    except (AttributeError, ValueError):  # fmt: skip
         return False
 
 
