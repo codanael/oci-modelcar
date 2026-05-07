@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-07
+
 ### Added
 - `IMAGEREFDIGEST=<registry>/<repo>@sha256:<digest>` variable in `push`
   output, suitable for direct piping into `cosign sign`. Re-emitted on

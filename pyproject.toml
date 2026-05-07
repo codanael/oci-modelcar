@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "oci-modelcar"
-version = "0.1.0"
+version = "0.2.0"
 description = "Stream HuggingFace models directly into OCI registries as multi-layer images"
 readme = "README.md"
 requires-python = ">=3.14"
