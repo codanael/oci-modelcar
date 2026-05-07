@@ -19,7 +19,7 @@ repos:
         pass_filenames: false
       - id: pytest-fast
         name: pytest (not e2e)
-        entry: pytest -m "not e2e" -q
+        entry: python3.14 -m pytest -m "not e2e" -q
         language: system
         pass_filenames: false
         stages: [pre-commit]
