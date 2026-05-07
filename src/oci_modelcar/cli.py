@@ -102,6 +102,9 @@ def _run_status(argv: list[str]) -> int:
             f"-> {tgt.get('registry', '?')}/{tgt.get('repo', '?')}:{tgt.get('tag', '?')}  "
             f"digest={digest[:23]}  completed={completed}\n"
         )
+        image_ref_digest = job.get("image_ref_digest")
+        if image_ref_digest:
+            sys.stdout.write(f"    ref={image_ref_digest}\n")
     return _EX_OK
 
 
