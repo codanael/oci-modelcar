@@ -111,10 +111,18 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     if state.is_completed(job_key) and not cfg.force:
         existing = state.get_job(job_key)
         assert existing is not None
-        plog.info(f"Job already completed: {existing['manifest_digest']}")
+        manifest_digest = str(existing["manifest_digest"])
+        image_ref_digest = (
+            existing.get("image_ref_digest")
+            or f"{cfg.registry}/{cfg.target_repo}@{manifest_digest}"
+        )
+        plog.info(f"Job already completed: {manifest_digest}")
+        plog.output_variable("manifestDigest", manifest_digest)
+        plog.output_variable("imageRef", image_ref)
+        plog.output_variable("imageRefDigest", image_ref_digest)
         return RunResult(
             job_key=job_key,
-            manifest_digest=str(existing["manifest_digest"]),
+            manifest_digest=manifest_digest,
             image_ref=image_ref,
             layers=[],
         )
