@@ -13,12 +13,13 @@ license-files = ["LICENSE"]
 authors = [{name = "codanael"}]
 keywords = ["huggingface", "oci", "kserve", "modelcar", "registry"]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: System Administrators",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.14",
-    "Topic :: System :: Archiving :: Packaging",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Utilities",
 ]
 dependencies = [
     "requests>=2.32",
@@ -37,7 +38,7 @@ dev = [
     "pytest-httpserver>=1.0",
     "ruff>=0.7",
     "mypy>=1.13",
-    "types-requests",
+    "types-requests>=2.32",
     "build>=1.2",
     "pre-commit>=4",
 ]
