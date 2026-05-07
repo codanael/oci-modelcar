@@ -52,6 +52,10 @@ def test_push_tiny_llama(local_registry, skopeo_bin, hf_endpoint, tmp_path):
     assert f"IMAGEREF={local_registry.host}/test/tiny-llama:{expected_tag}" in proc.stdout
     m = re.search(r"^MANIFESTDIGEST=(sha256:[0-9a-f]{64})$", proc.stdout, re.MULTILINE)
     assert m, f"no MANIFEST= in stdout:\n{proc.stdout}"
+    expected_digest_ref = f"IMAGEREFDIGEST={local_registry.host}/test/tiny-llama@{m.group(1)}"
+    assert expected_digest_ref in proc.stdout, (
+        f"expected '{expected_digest_ref}' in stdout:\n{proc.stdout}"
+    )
 
     # skopeo inspect
     raw = subprocess.check_output(
