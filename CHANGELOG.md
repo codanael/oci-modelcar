@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `IMAGEREFDIGEST=<registry>/<repo>@sha256:<digest>` variable in `push`
+  output, suitable for direct piping into `cosign sign`. Re-emitted on
+  idempotent re-runs.
+- `image_ref_digest` field persisted in the state file and surfaced as a
+  second indented line in `oci-modelcar status` output. Legacy state files
+  without this field continue to render the single existing line.
+- PEP 740 digital attestations published with PyPI artifacts via Sigstore
+  keyless OIDC (one-line release-workflow change). Verifiable with
+  `pypi-attestations` or `cosign verify-blob`.
+- README "Signing & verification" section with cosign sign/verify recipes
+  (keyless + static-key) for modelcar OCI images.
+
+### Changed
+- `JsonStateStore.mark_completed()` now requires `image_ref_digest=` keyword
+  argument. Breaking change for direct API consumers; CLI users unaffected.
+
 ## [0.1.0] - 2026-05-07
 
 Initial release.
