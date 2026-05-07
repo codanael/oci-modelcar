@@ -128,6 +128,19 @@ class ChunkedBlobUpload:
                     if self.server_offset >= end + 1:
                         return
                     continue
+                if r.status_code in (408, 429) or 500 <= r.status_code < 600:
+                    log.warning(
+                        "PATCH transient %d at [%d-%d] attempt %d",
+                        r.status_code,
+                        start,
+                        end,
+                        attempt + 1,
+                    )
+                    self._sleep_backoff(attempt)
+                    self._resync()
+                    if self.server_offset >= end + 1:
+                        return
+                    continue
                 r.raise_for_status()
             except (
                 requests.exceptions.ConnectionError,
@@ -150,7 +163,7 @@ class ChunkedBlobUpload:
             try:
                 end = int(rng.split("-")[1])
                 self.server_offset = end + 1
-            except ValueError, IndexError:
+            except (ValueError, IndexError):  # fmt: skip
                 self.server_offset = 0
         else:
             self.server_offset = 0
