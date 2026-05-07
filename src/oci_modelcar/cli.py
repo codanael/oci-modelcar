@@ -108,8 +108,7 @@ def _run_status(argv: list[str]) -> int:
 def _run_validate(argv: list[str]) -> int:
     import argparse
 
-    from oci_modelcar.http import build_session, oci_auth_header
-    from oci_modelcar.oci import ML_MAN
+    from oci_modelcar.oci import ML_MAN, OciClient
 
     p = argparse.ArgumentParser(prog="oci-modelcar validate")
     p.add_argument("--registry", required=True, help="Registry host (e.g. ghcr.io)")
@@ -121,10 +120,9 @@ def _run_validate(argv: list[str]) -> int:
     repo: str = ns.target_repo
     tag: str = ns.target_tag
 
-    session = build_session()
-    auth = oci_auth_header(registry)
-    url = f"https://{registry}/v2/{repo}/manifests/{tag}"
-    r = session.get(url, headers={**auth, "Accept": ML_MAN}, timeout=30)
+    client = OciClient(registry_host=registry)
+    url = client.url(repo, "manifests", tag)
+    r = client.session.get(url, headers={**client.auth, "Accept": ML_MAN}, timeout=30)
     if r.status_code == 200:
         digest = r.headers.get("Docker-Content-Digest", "(no digest)")
         sys.stdout.write(f"OK  {registry}/{repo}:{tag}  {digest}\n")
