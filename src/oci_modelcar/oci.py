@@ -228,3 +228,23 @@ def head_blob(client: OciClient, repo: str, digest: str) -> dict[str, object]:
         raise RuntimeError(f"digest mismatch on HEAD {digest}: server returned {got!r}")
     cl = r.headers.get("Content-Length", "0")
     return {"digest": digest, "size": int(cl)}
+
+
+def push_manifest(client: OciClient, repo: str, tag: str, manifest_bytes: bytes) -> str:
+    url = client.url(repo, "manifests", tag)
+    hdr = {**client.auth, "Content-Type": ML_MAN}
+    r = client.session.put(url, data=manifest_bytes, headers=hdr, timeout=60)
+    if r.status_code not in (200, 201):
+        r.raise_for_status()
+    return "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def validate_manifest_tag(client: OciClient, repo: str, tag: str, expected_digest: str) -> None:
+    url = client.url(repo, "manifests", tag)
+    r = client.session.get(url, headers={**client.auth, "Accept": ML_MAN}, timeout=30)
+    r.raise_for_status()
+    got = r.headers.get("Docker-Content-Digest", "")
+    if got != expected_digest:
+        raise RuntimeError(
+            f"manifest digest mismatch on tag {tag}: expected {expected_digest} got {got!r}"
+        )
