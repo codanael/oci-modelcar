@@ -40,8 +40,13 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
         # Trusted Publisher: configure on pypi.org under
         # Project Settings -> Publishing, link this repo + workflow.
+        # attestations:true enables PEP 740 digital attestations via
+        # Sigstore keyless OIDC. id-token: write is already set at the
+        # workflow level (line 10).
 
   release:
     needs: build
