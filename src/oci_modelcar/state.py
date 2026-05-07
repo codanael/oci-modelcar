@@ -138,6 +138,7 @@ class JsonStateStore:
     def mark_completed(
         self,
         job_key: str,
+        *,
         manifest_digest: str,
         image_ref_digest: str,
     ) -> None:
