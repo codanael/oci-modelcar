@@ -32,6 +32,11 @@ def _envbool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _envstr(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    return raw if raw else default
+
+
 @dataclass
 class Config:
     hf_repo: str
@@ -67,29 +72,37 @@ class Config:
             hf_repo=ns.hf_repo or os.environ.get("HF_REPO", ""),
             registry=ns.registry or os.environ.get("REGISTRY", ""),
             target_repo=ns.target_repo or os.environ.get("TARGET_REPO", ""),
-            hf_revision=ns.hf_revision or os.environ.get("HF_REVISION", "main"),
-            hf_endpoint=(ns.hf_endpoint or os.environ.get("HF_ENDPOINT", "https://huggingface.co")),
+            hf_revision=ns.hf_revision or _envstr("HF_REVISION", "main"),
+            hf_endpoint=(ns.hf_endpoint or _envstr("HF_ENDPOINT", "https://huggingface.co")),
             target_tag=ns.target_tag or os.environ.get("TARGET_TAG") or None,
-            also_tags=_parse_csv(ns.also_tag or os.environ.get("ALSO_TAGS", "")),
+            also_tags=_parse_csv(ns.also_tag or _envstr("ALSO_TAGS", "")),
             allow_patterns=tuple(
-                (ns.allow_patterns or os.environ.get("ALLOW_PATTERNS", _DEFAULT_ALLOW)).split()
+                (ns.allow_patterns or _envstr("ALLOW_PATTERNS", _DEFAULT_ALLOW)).split()
             ),
             layer_prefix=(
                 ns.layer_prefix
                 if ns.layer_prefix is not None
-                else os.environ.get("LAYER_PATH_PREFIX", "models/")
+                else _envstr("LAYER_PATH_PREFIX", "models/")
             ),
-            chunk_mib=int(ns.chunk_mib or os.environ.get("CHUNK_MIB", "8")),
-            workers=int(ns.workers or os.environ.get("WORKERS", "1")),
+            chunk_mib=int(ns.chunk_mib if ns.chunk_mib is not None else _envstr("CHUNK_MIB", "8")),
+            workers=int(ns.workers if ns.workers is not None else _envstr("WORKERS", "1")),
             state_file=Path(
                 ns.state_file
-                or os.environ.get(
+                or _envstr(
                     "STATE_FILE",
                     str(_xdg_state_home() / "oci-modelcar" / "state.json"),
                 )
             ),
-            hf_max_retries=int(ns.hf_max_retries or os.environ.get("HF_MAX_RETRIES", "10")),
-            oci_max_retries=int(ns.oci_max_retries or os.environ.get("OCI_MAX_RETRIES", "10")),
+            hf_max_retries=int(
+                ns.hf_max_retries
+                if ns.hf_max_retries is not None
+                else _envstr("HF_MAX_RETRIES", "10")
+            ),
+            oci_max_retries=int(
+                ns.oci_max_retries
+                if ns.oci_max_retries is not None
+                else _envstr("OCI_MAX_RETRIES", "10")
+            ),
             fail_fast=(
                 False if ns.continue_on_error else (ns.fail_fast or _envbool("FAIL_FAST", True))
             ),
@@ -114,6 +127,12 @@ class Config:
             raise ConfigError(f"workers must be in [1, 8], got {self.workers}")
         if not (1 <= self.chunk_mib <= 1024):
             raise ConfigError(f"chunk_mib must be in [1, 1024], got {self.chunk_mib}")
+        if not (0 <= self.hf_max_retries <= 100):
+            raise ConfigError(f"hf_max_retries must be in [0, 100], got {self.hf_max_retries}")
+        if not (0 <= self.oci_max_retries <= 100):
+            raise ConfigError(f"oci_max_retries must be in [0, 100], got {self.oci_max_retries}")
+        if self.verbose and self.quiet:
+            raise ConfigError("verbose and quiet are mutually exclusive")
         if self.target_tag is not None and not _TAG_RE.match(self.target_tag):
             raise ConfigError(
                 f"target_tag {self.target_tag!r} does not match [a-zA-Z0-9_][a-zA-Z0-9._-]{{0,127}}"
