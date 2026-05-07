@@ -135,10 +135,16 @@ class JsonStateStore:
         job = self._data["jobs"].get(job_key)
         return bool(job and job.get("manifest_digest"))
 
-    def mark_completed(self, job_key: str, manifest_digest: str) -> None:
+    def mark_completed(
+        self,
+        job_key: str,
+        manifest_digest: str,
+        image_ref_digest: str,
+    ) -> None:
         with self._lock:
             job = self._data["jobs"][job_key]
             job["manifest_digest"] = manifest_digest
+            job["image_ref_digest"] = image_ref_digest
             job["completed_at"] = _now_iso()
             job["updated_at"] = _now_iso()
 
