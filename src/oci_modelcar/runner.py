@@ -97,7 +97,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     plog.info(f"Revision    : {revision_resolved}")
 
     target_tag = derive_tag(revision_resolved, explicit=cfg.target_tag)
-    image_ref = f"{cfg.registry}/{cfg.target_repo}:{target_tag}"
+    image_ref = f"{oci_client.host}/{cfg.target_repo}:{target_tag}"
     plog.info(f"Target      : {image_ref}")
 
     job_key = JsonStateStore.compute_job_key(
@@ -114,7 +114,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
         manifest_digest = str(existing["manifest_digest"])
         image_ref_digest = (
             existing.get("image_ref_digest")
-            or f"{cfg.registry}/{cfg.target_repo}@{manifest_digest}"
+            or f"{oci_client.host}/{cfg.target_repo}@{manifest_digest}"
         )
         plog.info(f"Job already completed: {manifest_digest}")
         plog.output_variable("manifestDigest", manifest_digest)
@@ -276,7 +276,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             expected_digest=manifest_digest,
         )
 
-    image_ref_digest = f"{cfg.registry}/{cfg.target_repo}@{manifest_digest}"
+    image_ref_digest = f"{oci_client.host}/{cfg.target_repo}@{manifest_digest}"
 
     state.mark_completed(
         job_key,
