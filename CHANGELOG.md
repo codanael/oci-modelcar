@@ -13,13 +13,20 @@ All notable changes to this project will be documented in this file.
   without this field continue to render the single existing line.
 - PEP 740 digital attestations published with PyPI artifacts via Sigstore
   keyless OIDC (one-line release-workflow change). Verifiable with
-  `pypi-attestations` or `cosign verify-blob`.
+  `pypi-attestations` (see README "Signing & verification").
 - README "Signing & verification" section with cosign sign/verify recipes
   (keyless + static-key) for modelcar OCI images.
 
 ### Changed
 - `JsonStateStore.mark_completed()` now requires `image_ref_digest=` keyword
-  argument. Breaking change for direct API consumers; CLI users unaffected.
+  argument (keyword-only). Breaking change for direct API consumers; CLI
+  users unaffected.
+
+### Fixed
+- `IMAGEREF` and `IMAGEREFDIGEST` no longer leak the `http://` / `https://`
+  scheme prefix when `--registry` is passed with one. Both outputs now use
+  the bare `host[:port]` form so they can feed directly into
+  `cosign sign $IMAGEREFDIGEST`.
 
 ## [0.1.0] - 2026-05-07
 
