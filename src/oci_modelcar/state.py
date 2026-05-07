@@ -20,7 +20,8 @@ def _now_iso() -> str:
 
 @dataclass
 class FileState:
-    size: int
+    size: int  # raw HF file size (used to validate against current tree)
+    layer_size: int  # tar-wrapped layer bytes (used in the manifest)
     digest: str
     diff_id: str
     pushed_at: str = field(default_factory=_now_iso)
@@ -56,7 +57,7 @@ class JsonStateStore:
             return {"version": 1, "jobs": {}}
         try:
             raw = json.loads(self.path.read_text())
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):  # fmt: skip
             return {"version": 1, "jobs": {}}
         if raw.get("version") != 1:
             raise RuntimeError(f"unsupported state file version: {raw.get('version')}")
@@ -117,11 +118,13 @@ class JsonStateStore:
         digest: str,
         diff_id: str,
         size: int,
+        layer_size: int,
     ) -> None:
         with self._lock:
             job = self._data["jobs"][job_key]
             job["files"][hf_path] = {
                 "size": size,
+                "layer_size": layer_size,
                 "digest": digest,
                 "diff_id": diff_id,
                 "pushed_at": _now_iso(),

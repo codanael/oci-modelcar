@@ -151,17 +151,24 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     pushed = 0
     failed: list[str] = []
 
-    def task_for_file(idx: int, hf_file: HfFile) -> tuple[int, BlobDescriptor, str]:
+    def task_for_file(idx: int, hf_file: HfFile) -> tuple[int, BlobDescriptor, str, bool]:
         cached = state.get_pushed(job_key, hf_file.path)
-        if cached is not None and cached.get("size") == hf_file.size and cached.get("pushed_at"):
+        cached_layer_size = cached.get("layer_size") if cached else None
+        if (
+            cached is not None
+            and cached.get("size") == hf_file.size
+            and cached.get("pushed_at")
+            and cached_layer_size is not None
+        ):
             return (
                 idx,
                 BlobDescriptor(
                     media_type=ML_TAR,
                     digest=str(cached["digest"]),
-                    size=int(cached.get("layer_size", cached["size"])),
+                    size=int(cached_layer_size),
                 ),
                 str(cached["diff_id"]),
+                True,  # was_cached
             )
         descriptor, diff_id = process_one_file(
             hf_client=hf_client,
@@ -180,9 +187,10 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             digest=descriptor.digest,
             diff_id=diff_id,
             size=hf_file.size,
+            layer_size=descriptor.size,
         )
         state.save()
-        return idx, descriptor, diff_id
+        return idx, descriptor, diff_id, False  # freshly pushed
 
     if cfg.workers == 1:
         for idx, hf_file in enumerate(files):
@@ -190,33 +198,39 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
                 f"[{idx + 1:>3}/{len(files)}] {hf_file.path} ({hf_file.size / 1e6:.1f} MB)"
             ) as scoped:
                 try:
-                    _, desc, diff = task_for_file(idx, hf_file)
+                    _, desc, diff, was_cached = task_for_file(idx, hf_file)
                     layers_by_idx[idx] = desc
                     diff_ids_by_idx[idx] = diff
-                    if state.has_pushed(job_key, hf_file.path, hf_file.size):
-                        prev = state.get_pushed(job_key, hf_file.path)
-                        if prev and prev.get("pushed_at"):
-                            scoped.info(f"-> {desc.digest[:23]}…")
-                            pushed += 1  # counts also re-uses
+                    scoped.info(f"-> {desc.digest[:23]}…")
+                    if was_cached:
+                        skipped += 1
+                    else:
+                        pushed += 1
                 except Exception as e:
                     scoped.error(f"failed: {e}")
                     failed.append(hf_file.path)
                     if cfg.fail_fast:
                         raise
     else:
+        future_to_path: dict[Future[tuple[int, BlobDescriptor, str, bool]], str] = {}
         with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-            futures: list[Future[tuple[int, BlobDescriptor, str]]] = [
-                pool.submit(task_for_file, i, f) for i, f in enumerate(files)
-            ]
-            for fut in as_completed(futures):
+            for i, f in enumerate(files):
+                fut = pool.submit(task_for_file, i, f)
+                future_to_path[fut] = f.path
+            for fut in as_completed(future_to_path):
+                path = future_to_path[fut]
                 try:
-                    idx, desc, diff = fut.result()
+                    idx, desc, diff, was_cached = fut.result()
                     layers_by_idx[idx] = desc
                     diff_ids_by_idx[idx] = diff
-                except Exception as e:
-                    failed.append(str(e))
+                    if was_cached:
+                        skipped += 1
+                    else:
+                        pushed += 1
+                except Exception:
+                    failed.append(path)
                     if cfg.fail_fast:
-                        for other in futures:
+                        for other in future_to_path:
                             other.cancel()
                         raise
 

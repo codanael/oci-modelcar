@@ -79,12 +79,48 @@ def test_mark_pushed_and_has_pushed(tmp_path: Path):
     store.upsert_job("k1", job)
     assert not store.has_pushed("k1", "model.safetensors", expected_size=100)
     store.mark_pushed(
-        "k1", "model.safetensors", digest="sha256:abc", diff_id="sha256:abc", size=100
+        "k1",
+        "model.safetensors",
+        digest="sha256:abc",
+        diff_id="sha256:abc",
+        size=100,
+        layer_size=512,
     )
     store.save()
     assert store.has_pushed("k1", "model.safetensors", expected_size=100)
     # Wrong size invalidates
     assert not store.has_pushed("k1", "model.safetensors", expected_size=200)
+
+
+def test_mark_pushed_persists_layer_size(tmp_path: Path):
+    """layer_size (tar-wrapped bytes) must be stored separately from raw hf size."""
+    store = JsonStateStore(tmp_path / "state.json")
+    job = JobState(
+        hf_repo="foo/bar",
+        hf_revision_input="main",
+        hf_revision_resolved="a" * 40,
+        registry="r",
+        target_repo="m",
+        target_tag="v1",
+    )
+    store.upsert_job("k1", job)
+    store.mark_pushed(
+        "k1",
+        "weights.bin",
+        digest="sha256:deadbeef",
+        diff_id="sha256:deadbeef",
+        size=1000,
+        layer_size=2048,
+    )
+    store.save()
+
+    # Reload from disk and verify both fields survive round-trip
+    store2 = JsonStateStore(tmp_path / "state.json")
+    entry = store2.get_pushed("k1", "weights.bin")
+    assert entry is not None
+    assert entry["size"] == 1000
+    assert entry["layer_size"] == 2048
+    assert entry["digest"] == "sha256:deadbeef"
 
 
 def test_mark_completed(tmp_path: Path):
@@ -122,6 +158,7 @@ def test_concurrent_writes_no_corruption(tmp_path: Path):
             digest=f"sha256:{i}",
             diff_id=f"sha256:{i}",
             size=i,
+            layer_size=i * 2,
         )
         store.save()
 
