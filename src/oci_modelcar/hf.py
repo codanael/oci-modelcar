@@ -59,3 +59,24 @@ class HfClient:
         r.raise_for_status()
         sha = r.json().get("sha")
         return str(sha) if sha else revision
+
+    def list_files(self, revision: str, allow: tuple[str, ...]) -> list[HfFile]:
+        """Return [HfFile, ...] sorted by path, filtered by extension."""
+        url = f"{self.endpoint}/api/models/{self.repo}/tree/{revision}"
+        r = self.session.get(
+            url,
+            headers=self.auth,
+            params={"recursive": "true"},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        out: list[HfFile] = []
+        for entry in r.json():
+            if entry.get("type") != "file":
+                continue
+            path = entry["path"]
+            if not any(path.endswith(ext) for ext in allow):
+                continue
+            out.append(HfFile(path=path, size=int(entry["size"])))
+        out.sort(key=lambda f: f.path)
+        return out
