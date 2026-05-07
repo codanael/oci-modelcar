@@ -1,4 +1,5 @@
 """Stream HuggingFace models into OCI registries as multi-layer images."""
+
 from importlib.metadata import PackageNotFoundError, version
 
 try:
