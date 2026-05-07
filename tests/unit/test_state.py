@@ -135,8 +135,37 @@ def test_mark_completed(tmp_path: Path):
     )
     store.upsert_job("k1", job)
     assert not store.is_completed("k1")
-    store.mark_completed("k1", manifest_digest="sha256:abc")
+    store.mark_completed(
+        "k1",
+        manifest_digest="sha256:abc",
+        image_ref_digest="r/m@sha256:abc",
+    )
     assert store.is_completed("k1")
+
+
+def test_mark_completed_persists_image_ref_digest(tmp_path: Path):
+    store = JsonStateStore(tmp_path / "state.json")
+    job = JobState(
+        hf_repo="foo/bar",
+        hf_revision_input="main",
+        hf_revision_resolved="a" * 40,
+        registry="r.example",
+        target_repo="m/x",
+        target_tag="v1",
+    )
+    store.upsert_job("k1", job)
+    store.mark_completed(
+        "k1",
+        manifest_digest="sha256:abc",
+        image_ref_digest="r.example/m/x@sha256:abc",
+    )
+    store.save()
+
+    fresh = JsonStateStore(tmp_path / "state.json")
+    raw_job = fresh.get_job("k1")
+    assert raw_job is not None
+    assert raw_job["manifest_digest"] == "sha256:abc"
+    assert raw_job["image_ref_digest"] == "r.example/m/x@sha256:abc"
 
 
 def test_concurrent_writes_no_corruption(tmp_path: Path):

@@ -268,11 +268,18 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             expected_digest=manifest_digest,
         )
 
-    state.mark_completed(job_key, manifest_digest=manifest_digest)
+    image_ref_digest = f"{cfg.registry}/{cfg.target_repo}@{manifest_digest}"
+
+    state.mark_completed(
+        job_key,
+        manifest_digest=manifest_digest,
+        image_ref_digest=image_ref_digest,
+    )
     state.save()
 
     plog.output_variable("manifestDigest", manifest_digest)
     plog.output_variable("imageRef", image_ref)
+    plog.output_variable("imageRefDigest", image_ref_digest)
     return RunResult(
         job_key=job_key,
         manifest_digest=manifest_digest,
