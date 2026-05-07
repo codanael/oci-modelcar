@@ -27,3 +27,17 @@ See `oci-modelcar push --help` for all options.
 ## License
 
 MIT
+
+## Releasing (maintainers)
+
+1. Bump `version` in `pyproject.toml` and update `CHANGELOG.md`.
+2. Tag: `git tag v0.1.0 && git push --tags`.
+3. The `release.yml` workflow builds, publishes to PyPI via Trusted Publishing,
+   and creates a GitHub Release.
+
+PyPI trusted publisher must be configured once: on pypi.org -> Project
+Settings -> Publishing -> Add publisher with:
+- Owner: `codanael`
+- Repo: `oci-modelcar`
+- Workflow: `release.yml`
+- Environment: `pypi`
