@@ -191,3 +191,40 @@ class ChunkedBlobUpload:
             r.raise_for_status()
             raise RuntimeError(f"unexpected status {r.status_code} on PUT close")
         return digest, self.total
+
+
+def push_small_blob(client: OciClient, repo: str, data: bytes) -> str:
+    """Monolithic POST + PUT for small blobs (config). Returns digest."""
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    head_url = client.url(repo, "blobs", digest)
+    h = client.session.head(head_url, headers=client.auth, timeout=30)
+    if h.status_code == 200:
+        return digest
+    init_url = client.url(repo, "blobs", "uploads") + "/"
+    r = client.session.post(init_url, headers=client.auth, timeout=30)
+    if r.status_code != 202:
+        r.raise_for_status()
+    loc = r.headers["Location"]
+    sep = "&" if "?" in loc else "?"
+    hdr = {
+        **client.auth,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(data)),
+    }
+    r = client.session.put(f"{loc}{sep}digest={digest}", data=data, headers=hdr, timeout=120)
+    if r.status_code != 201:
+        r.raise_for_status()
+    return digest
+
+
+def head_blob(client: OciClient, repo: str, digest: str) -> dict[str, object]:
+    """HEAD a blob, validate Docker-Content-Digest, return {digest, size}."""
+    url = client.url(repo, "blobs", digest)
+    r = client.session.head(url, headers=client.auth, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"blob not found in {repo}: {digest}")
+    got = r.headers.get("Docker-Content-Digest", "")
+    if got != digest:
+        raise RuntimeError(f"digest mismatch on HEAD {digest}: server returned {got!r}")
+    cl = r.headers.get("Content-Length", "0")
+    return {"digest": digest, "size": int(cl)}
