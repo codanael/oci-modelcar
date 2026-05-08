@@ -145,7 +145,25 @@ class ChunkedBlobUpload:
         # already-acked bytes — otherwise the server returns 416 forever.
         initial_offset = self.server_offset
         target_end = initial_offset + len(chunk) - 1
-        for attempt in range(self.max_retries):
+        # Progress-aware retry budget: a retry that walked the offset forward
+        # proves the connection works at least intermittently, so we refresh
+        # the budget for the rest of the chunk. A long upload through a flaky
+        # proxy can survive an arbitrary number of cuts as long as each one
+        # makes some progress. Budget only exhausts on consecutive zero-progress
+        # failures.
+        attempts_left = self.max_retries
+        backoff_idx = 0
+        last_offset = self.server_offset
+        while True:
+            if self.server_offset > last_offset:
+                attempts_left = self.max_retries
+                backoff_idx = 0
+            last_offset = self.server_offset
+            if attempts_left <= 0:
+                raise RuntimeError(
+                    f"PATCH retries exhausted at offset {self.server_offset} "
+                    f"(target {target_end}, started at {initial_offset})"
+                )
             bytes_done = self.server_offset - initial_offset
             if bytes_done >= len(chunk):
                 return
@@ -170,6 +188,8 @@ class ChunkedBlobUpload:
                     self._resync()
                     if self.server_offset >= target_end + 1:
                         return
+                    attempts_left -= 1
+                    backoff_idx += 1
                     continue
                 if r.status_code in (408, 429) or 500 <= r.status_code < 600:
                     log.warning(
@@ -177,12 +197,14 @@ class ChunkedBlobUpload:
                         r.status_code,
                         slice_start,
                         target_end,
-                        attempt + 1,
+                        backoff_idx + 1,
                     )
-                    self._sleep_backoff(attempt)
+                    self._sleep_backoff(backoff_idx)
                     self._resync()
                     if self.server_offset >= target_end + 1:
                         return
+                    attempts_left -= 1
+                    backoff_idx += 1
                     continue
                 r.raise_for_status()
             except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as e:
@@ -194,12 +216,14 @@ class ChunkedBlobUpload:
                         "PATCH SSL EOF [%d-%d] attempt %d, resyncing",
                         slice_start,
                         target_end,
-                        attempt + 1,
+                        backoff_idx + 1,
                     )
-                    self._sleep_backoff(attempt)
+                    self._sleep_backoff(backoff_idx)
                     self._resync()
                     if self.server_offset >= target_end + 1:
                         return
+                    attempts_left -= 1
+                    backoff_idx += 1
                     continue
                 raise
             except (
@@ -211,17 +235,15 @@ class ChunkedBlobUpload:
                     "PATCH failed [%d-%d] attempt %d: %s",
                     slice_start,
                     target_end,
-                    attempt + 1,
+                    backoff_idx + 1,
                     e,
                 )
-                self._sleep_backoff(attempt)
+                self._sleep_backoff(backoff_idx)
                 self._resync()
                 if self.server_offset >= target_end + 1:
                     return
-        raise RuntimeError(
-            f"PATCH retries exhausted at offset {self.server_offset} "
-            f"(target {target_end}, started at {initial_offset})"
-        )
+                attempts_left -= 1
+                backoff_idx += 1
 
     def _resync(self) -> None:
         r = self.client.session.get(self.location, headers=self.client.auth, timeout=30)

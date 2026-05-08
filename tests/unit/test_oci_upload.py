@@ -179,6 +179,50 @@ def test_chunked_upload_retries_on_ssl_eof_mid_stream(httpserver: HTTPServer):
     assert calls["n"] >= 2, "must have retried after SSL EOF"
 
 
+def test_retry_budget_resets_when_server_makes_progress(httpserver: HTTPServer):
+    """A hostile proxy that drops mid-PATCH but lets the server commit a few
+    bytes each time should NOT exhaust the retry budget, because each retry
+    is real progress. With max_retries=2 we need 4 PATCH attempts to walk
+    the chunk forward in 16-byte hops — only possible if the budget refreshes
+    on observed progress (server_offset advances)."""
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/grind")}
+    )
+
+    # Server walks forward 16 bytes per resync, mimicking the bytes that were
+    # actually committed before each mid-stream cut.
+    progress = {"committed": 0}
+
+    def get_handler(request: Any) -> Response:
+        progress["committed"] += 16
+        end = min(progress["committed"], 64) - 1
+        return Response("", status=204, headers={"Range": f"0-{end}"})
+
+    httpserver.expect_request("/upload/grind", method="GET").respond_with_handler(get_handler)
+    httpserver.expect_request("/upload/grind", method="PUT").respond_with_data("", status=201)
+
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client, repo="repo", chunk_size=64, max_retries=2, backoff_initial=0.0
+    )
+
+    patch_calls = {"n": 0}
+
+    def always_eof_patch(self: requests.Session, *args: object, **kwargs: object) -> object:
+        patch_calls["n"] += 1
+        raise requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2437)")
+
+    with patch.object(requests.Session, "patch", always_eof_patch):
+        upload.write(b"Z" * 64)
+        upload.close()
+
+    # 4 PATCHes attempted, but with reset-on-progress none ever "exhausted".
+    assert patch_calls["n"] == 4, (
+        f"expected 4 PATCH attempts (each making progress should refresh "
+        f"the budget), got {patch_calls['n']}"
+    )
+
+
 def test_chunked_upload_does_not_retry_on_proxy_error(httpserver: HTTPServer):
     httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
         "", status=202, headers={"Location": httpserver.url_for("/upload/px")}
