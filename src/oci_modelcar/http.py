@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import logging
 import os
 import ssl
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -13,6 +17,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from oci_modelcar import __version__
+
+log = logging.getLogger(__name__)
 
 
 def _envbool(name: str) -> bool:
@@ -86,6 +92,101 @@ class _SafeSession(requests.Session):
         new_netloc = urlparse(prepared_request.url or "").netloc
         if new_netloc and new_netloc != original_netloc:
             del prepared_request.headers["Authorization"]
+
+
+def huggingface_token() -> str | None:
+    """Resolve HF token. Priority: HF_TOKEN > HUGGING_FACE_HUB_TOKEN > cache file.
+    Returns None if HF_HUB_DISABLE_IMPLICIT_TOKEN is set."""
+    if _envbool("HF_HUB_DISABLE_IMPLICIT_TOKEN"):
+        return None
+    for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        tok = os.environ.get(env_name)
+        if tok:
+            return tok
+    cache = Path.home() / ".cache" / "huggingface" / "token"
+    if cache.is_file():
+        try:
+            content = cache.read_text().strip()
+            return content or None
+        except OSError:
+            return None
+    return None
+
+
+def huggingface_auth_header() -> dict[str, str]:
+    tok = huggingface_token()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+def oci_auth_header(registry_host: str, target_repo: str | None = None) -> dict[str, str]:
+    """Resolve OCI registry auth: env > ~/.docker/config.json > podman auth.json."""
+    target = f"{registry_host}/{target_repo}" if target_repo else registry_host
+
+    user = os.environ.get("OCI_USERNAME")
+    pwd = os.environ.get("OCI_PASSWORD")
+    if user and pwd is not None:
+        log.info("OCI auth resolved from OCI_USERNAME/OCI_PASSWORD env")
+        token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+
+    for path in _auth_search_paths():
+        auth = _docker_config_auth(path, target)
+        if auth:
+            log.info("OCI auth resolved from %s", path)
+            return {"Authorization": f"Basic {auth}"}
+
+    log.warning(
+        "no OCI credentials found for %s — pushing anonymously "
+        "(set OCI_USERNAME/OCI_PASSWORD or run `podman login`/`docker login`)",
+        target,
+    )
+    return {}
+
+
+def _auth_search_paths() -> list[Path]:
+    paths = [Path.home() / ".docker" / "config.json"]
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        paths.append(Path(xdg_runtime) / "containers" / "auth.json")
+    xdg_config = os.environ.get("XDG_CONFIG_HOME")
+    config_root = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    paths.append(config_root / "containers" / "auth.json")
+    return paths
+
+
+def _normalize_auth_key(key: str) -> str:
+    for prefix in ("https://", "http://"):
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+            break
+    key = key.rstrip("/")
+    if key.endswith("/v2"):
+        key = key[: -len("/v2")].rstrip("/")
+    return key
+
+
+def _docker_config_auth(path: Path, target: str) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    auths = data.get("auths", {})
+    if not isinstance(auths, dict):
+        return None
+    best_key, best_len = None, -1
+    for raw_key in auths:
+        norm = _normalize_auth_key(raw_key)
+        if (norm == target or target.startswith(norm + "/")) and len(norm) > best_len:
+            best_key, best_len = raw_key, len(norm)
+    if best_key is None:
+        return None
+    entry = auths[best_key]
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("auth")
+    return raw if isinstance(raw, str) and raw else None
 
 
 def build_session() -> requests.Session:

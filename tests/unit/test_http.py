@@ -1,4 +1,6 @@
+import json
 import ssl
+from pathlib import Path
 
 import pytest
 import requests
@@ -132,3 +134,96 @@ def test_authorization_preserved_on_same_origin_redirect(httpserver):
     r = s.get(httpserver.url_for("/redirect"), headers={"Authorization": "Bearer hf_secret"})
     r.raise_for_status()
     assert seen_auth_on_target == ["Bearer hf_secret"]
+
+
+def test_huggingface_token_from_hf_token_env(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "tok_a")
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_a"
+
+
+def test_huggingface_token_from_hub_token_env(monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "tok_b")
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_b"
+
+
+def test_huggingface_token_priority(monkeypatch):
+    """HF_TOKEN wins over HUGGING_FACE_HUB_TOKEN."""
+    monkeypatch.setenv("HF_TOKEN", "tok_a")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "tok_b")
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_a"
+
+
+def test_huggingface_token_disabled_by_env(monkeypatch):
+    """HF_HUB_DISABLE_IMPLICIT_TOKEN=1 returns None even if a token is set."""
+    monkeypatch.setenv("HF_TOKEN", "tok_a")
+    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() is None
+
+
+def test_huggingface_token_from_cache_file(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".cache" / "huggingface" / "token"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("tok_from_file\n")
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_from_file"
+
+
+def test_oci_auth_header_from_env(monkeypatch):
+    monkeypatch.setenv("OCI_USERNAME", "alice")
+    monkeypatch.setenv("OCI_PASSWORD", "s3cret")
+    from oci_modelcar.http import oci_auth_header
+
+    h = oci_auth_header("registry.example.com")
+    assert h["Authorization"].startswith("Basic ")
+
+
+def test_oci_auth_header_from_docker_config(monkeypatch, tmp_path):
+    import base64
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg = tmp_path / ".docker" / "config.json"
+    cfg.parent.mkdir(parents=True)
+    auth = base64.b64encode(b"alice:s3cret").decode()
+    cfg.write_text(json.dumps({"auths": {"registry.example.com": {"auth": auth}}}))
+    from oci_modelcar.http import oci_auth_header
+
+    h = oci_auth_header("registry.example.com")
+    assert h["Authorization"] == f"Basic {auth}"
+
+
+def test_oci_auth_anonymous_when_no_credentials(monkeypatch, tmp_path, caplog):
+    import logging
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    from oci_modelcar.http import oci_auth_header
+
+    with caplog.at_level(logging.WARNING):
+        h = oci_auth_header("registry.example.com")
+    assert h == {}
+    assert any("anonymously" in r.message for r in caplog.records)
