@@ -8,7 +8,7 @@ import pytest
 from oci_modelcar.config import Config
 from oci_modelcar.download import HfFile
 from oci_modelcar.logging import PipelineLogger
-from oci_modelcar.manifest import BlobDescriptor
+from oci_modelcar.manifest import ML_TAR, BlobDescriptor
 from oci_modelcar.pipeline import FileWorker, Pipeline
 
 
@@ -352,3 +352,147 @@ def test_pipeline_continue_on_error_collects_failures(
     pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
     with pytest.raises(PartialFailureError):
         pipeline.run()
+
+
+# ---------------------------------------------------------------------------
+# Task 8.6: Tag conflict policy
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_tag_match_skips_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If existing tag matches the manifest digest we'd produce, skip push."""
+    from oci_modelcar.pipeline import RunResult
+
+    cfg, plog = _build_pipeline(tmp_path, workers=1)
+
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeef" * 5
+    fake_downloader.list_files.return_value = [HfFile("a.bin", 100, None)]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 100 * 1024**3})(),
+    )
+
+    expected_digest = "sha256:" + "f" * 64
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.get_manifest_digest_at_tag",
+        lambda *a, **kw: expected_digest,
+    )
+
+    monkeypatch.setattr(
+        FileWorker,
+        "process",
+        lambda self, *a, **kw: BlobDescriptor(
+            media_type=ML_TAR, digest="sha256:" + "a" * 64, size=100, hf_path="a.bin"
+        ),
+    )
+
+    def fake_assemble(
+        self: Pipeline, target_tag: str, descriptors: list[BlobDescriptor]
+    ) -> RunResult:
+        return RunResult(
+            manifest_digest=expected_digest,
+            image_ref="x:y",
+            image_ref_digest="x@" + expected_digest,
+            layers=tuple(descriptors),
+        )
+
+    monkeypatch.setattr(Pipeline, "_assemble_manifest", fake_assemble)
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    result = pipeline.run()
+    assert result.manifest_digest == expected_digest
+
+
+def test_pipeline_tag_conflict_no_force_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing tag with DIFFERENT digest, no --force → PushError."""
+    from oci_modelcar.errors import PushError
+    from oci_modelcar.pipeline import RunResult
+
+    cfg, plog = _build_pipeline(tmp_path, workers=1, force=False)
+
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeef" * 5
+    fake_downloader.list_files.return_value = [HfFile("a.bin", 100, None)]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 100 * 1024**3})(),
+    )
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.get_manifest_digest_at_tag",
+        lambda *a, **kw: "sha256:" + "1" * 64,
+    )
+
+    # Workers succeed; _assemble_manifest produces a DIFFERENT digest
+    monkeypatch.setattr(
+        FileWorker,
+        "process",
+        lambda self, *a, **kw: BlobDescriptor(
+            media_type=ML_TAR, digest="sha256:" + "a" * 64, size=100, hf_path="a.bin"
+        ),
+    )
+
+    def fake_assemble_diff(
+        self: Pipeline, target_tag: str, descriptors: list[BlobDescriptor]
+    ) -> RunResult:
+        return RunResult(
+            manifest_digest="sha256:" + "2" * 64,  # differs from existing "sha256:1..1"
+            image_ref="x:y",
+            image_ref_digest="x@sha256:" + "2" * 64,
+            layers=tuple(descriptors),
+        )
+
+    monkeypatch.setattr(Pipeline, "_assemble_manifest", fake_assemble_diff)
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    with pytest.raises(PushError, match="tag exists with different digest"):
+        pipeline.run()
+
+
+def test_pipeline_tag_conflict_with_force_overwrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oci_modelcar.pipeline import RunResult
+
+    cfg, plog = _build_pipeline(tmp_path, workers=1, force=True)
+
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeef" * 5
+    fake_downloader.list_files.return_value = [HfFile("a.bin", 100, None)]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 100 * 1024**3})(),
+    )
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.get_manifest_digest_at_tag",
+        lambda *a, **kw: "sha256:" + "1" * 64,  # differs but --force overrides
+    )
+    monkeypatch.setattr(
+        FileWorker,
+        "process",
+        lambda self, *a, **kw: BlobDescriptor(
+            media_type=ML_TAR, digest="sha256:" + "a" * 64, size=100, hf_path="a.bin"
+        ),
+    )
+    monkeypatch.setattr(
+        Pipeline,
+        "_assemble_manifest",
+        lambda self, t, d: RunResult(
+            manifest_digest="sha256:new",
+            image_ref="x",
+            image_ref_digest="y",
+            layers=tuple(d),
+        ),
+    )
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    result = pipeline.run()
+    assert result.manifest_digest == "sha256:new"  # overwrote existing

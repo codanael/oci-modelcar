@@ -242,6 +242,9 @@ class Pipeline:
 
     def run(self) -> RunResult:
         revision, files, target_tag = self._preflight()
+        existing_tag_digest = get_manifest_digest_at_tag(
+            self.registry_client, self.cfg.target_repo, target_tag
+        )
         self._check_disk_space(files)
 
         if self.cfg.dry_run:
@@ -305,10 +308,22 @@ class Pipeline:
                 hint="re-run; succeeded blobs are cached in registry",
             )
 
-        return self._assemble_manifest(target_tag, descriptors)
+        result = self._assemble_manifest(target_tag, descriptors)
+        if existing_tag_digest is not None and existing_tag_digest != result.manifest_digest:
+            if not self.cfg.force:
+                raise PushError(
+                    f"tag exists with different digest for {target_tag!r}: "
+                    f"registry has {existing_tag_digest}, computed {result.manifest_digest}",
+                    hint="use --force to overwrite, or pick a different --target-tag.",
+                )
+            self.plog.warning(
+                f"tag {target_tag!r} existed at {existing_tag_digest} "
+                f"but --force overwrote with {result.manifest_digest}"
+            )
+        return result
 
     def _assemble_manifest(self, target_tag: str, descriptors: list[BlobDescriptor]) -> RunResult:
-        """Assemble and push OCI config + manifest. Tag conflict check deferred to Task 8.6."""
+        """Assemble and push OCI config + manifest."""
         descriptors.sort(key=lambda d: d.hf_path)
         diff_ids = [d.digest for d in descriptors]
         config_bytes = build_config_bytes(diff_ids)
