@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import requests
 import urllib3.exceptions
 
-from oci_modelcar.http import _is_transient_ssl, build_session, huggingface_auth_header
+from oci_modelcar.http import build_session, huggingface_auth_header, is_transient_ssl
 
 log = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class HfStream:
                 # real cause immediately. But an SSL EOF after bytes already
                 # flowed is just a connection cut; resume via Range like any
                 # other transient transport error.
-                if isinstance(e, requests.exceptions.SSLError) and _is_transient_ssl(e):
+                if isinstance(e, requests.exceptions.SSLError) and is_transient_ssl(e):
                     log.warning(
                         "HF SSL EOF mid-stream for %s at %d/%d (attempt %d/%d); resuming via Range",
                         self.path,
