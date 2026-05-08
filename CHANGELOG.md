@@ -4,16 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-08
+
 ### Fixed
 - **Mid-stream SSL EOF is now correctly treated as transient.** Regression
   introduced in 0.4.0: the early-raise fix for SSL handshake failures was
   too broad and also caught `ssl.SSLEOFError` ("EOF occurred in violation
   of protocol") raised when an idle proxy or firewall cuts a long-running
-  TCP connection mid-transfer. Symptom seen on a 1.34 GB shard. The cause
-  chain of the exception is now walked for `ssl.SSLEOFError` (or the
-  matching message string), and when found the error is treated as
-  transient: `HfStream` resumes via Range and `ChunkedBlobUpload` resyncs
-  + retries. Pure handshake / cert-validation SSL errors remain fatal.
+  TCP connection mid-transfer. Symptom seen on a 1.34 GB shard. The
+  exception's `__cause__` and `__context__` chains are now walked for
+  `ssl.SSLEOFError` (with a string-marker fallback for wrappers that
+  drop the chain), and when found the error is treated as transient:
+  `HfStream` resumes via Range and `ChunkedBlobUpload` resyncs + retries.
+  Pure handshake / cert-validation SSL errors remain fatal.
 
 ## [0.4.0] - 2026-05-08
 
