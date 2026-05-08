@@ -258,3 +258,97 @@ def test_pipeline_disk_space_clean_hf_lowers_required(
         lambda p: type("DU", (), {"free": 5 * 1024**3})(),
     )
     pipeline._check_disk_space(files)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Task 8.5: Pipeline.run with ThreadPoolExecutor + fail-fast
+# ---------------------------------------------------------------------------
+
+import time  # noqa: E402
+
+
+def test_pipeline_fail_fast_cancels_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When one worker raises, stop_event must be set and the loop exit
+    within ~1 second (cancel_futures kills pending)."""
+    cfg, plog = _build_pipeline(tmp_path, workers=2)
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeef" * 5
+    fake_downloader.list_files.return_value = [HfFile(f"f{i}.bin", 100, None) for i in range(8)]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 100 * 1024**3})(),
+    )
+
+    call_count: dict[str, int] = {"n": 0}
+
+    def fake_process(  # type: ignore[misc]
+        self: FileWorker,
+        repo: str,
+        revision: str,
+        hf_file: HfFile,
+        progress_cb: object = None,
+    ) -> object:
+        call_count["n"] += 1
+        if hf_file.path == "f0.bin":
+            raise RuntimeError("simulated f0 failure")
+        for _ in range(50):
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("stop_event")
+            time.sleep(0.05)
+        return MagicMock()
+
+    monkeypatch.setattr(FileWorker, "process", fake_process)
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="simulated f0 failure"):
+        pipeline.run()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0, f"fail-fast took too long: {elapsed:.1f}s"
+
+
+def test_pipeline_continue_on_error_collects_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oci_modelcar.errors import PartialFailureError
+
+    cfg, plog = _build_pipeline(tmp_path, workers=2, fail_fast=False)
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeef" * 5
+    fake_downloader.list_files.return_value = [
+        HfFile("good.bin", 100, None),
+        HfFile("bad.bin", 100, None),
+    ]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 100 * 1024**3})(),
+    )
+
+    def fake_process(  # type: ignore[misc]
+        self: FileWorker,
+        repo: str,
+        revision: str,
+        hf_file: HfFile,
+        progress_cb: object = None,
+    ) -> BlobDescriptor:
+        if hf_file.path == "bad.bin":
+            raise RuntimeError("bad failed")
+        return BlobDescriptor(
+            media_type="application/vnd.oci.image.layer.v1.tar",
+            digest="sha256:" + "a" * 64,
+            size=100,
+            hf_path="good.bin",
+        )
+
+    monkeypatch.setattr(FileWorker, "process", fake_process)
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    with pytest.raises(PartialFailureError):
+        pipeline.run()

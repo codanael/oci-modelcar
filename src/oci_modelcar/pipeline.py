@@ -3,21 +3,37 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import shutil
 import threading
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from oci_modelcar.config import Config
 from oci_modelcar.download import HfDownloader, HfFile
-from oci_modelcar.errors import ConfigError, DiskSpaceError, PushError
+from oci_modelcar.errors import ConfigError, DiskSpaceError, PartialFailureError, PushError
 from oci_modelcar.layer import build_layer_to_file, tar_layer_size
 from oci_modelcar.logging import PipelineLogger
-from oci_modelcar.manifest import ML_MAN, ML_TAR, BlobDescriptor, derive_tag
-from oci_modelcar.registry import OciClient, StreamingBlobUpload
+from oci_modelcar.manifest import (
+    ML_MAN,
+    ML_TAR,
+    BlobDescriptor,
+    build_config_bytes,
+    build_manifest_bytes,
+    derive_tag,
+)
+from oci_modelcar.registry import (
+    OciClient,
+    StreamingBlobUpload,
+    head_blob,
+    push_manifest,
+    push_small_blob,
+    validate_manifest_tag,
+)
 
 log = logging.getLogger(__name__)
 
@@ -223,3 +239,108 @@ class Pipeline:
                     f"or lower --workers (currently {self.cfg.workers})."
                 ),
             )
+
+    def run(self) -> RunResult:
+        revision, files, target_tag = self._preflight()
+        self._check_disk_space(files)
+
+        if self.cfg.dry_run:
+            self.plog.info("dry-run: skipping push")
+            return RunResult(
+                manifest_digest="",
+                image_ref="",
+                image_ref_digest="",
+                layers=(),
+                skipped_blobs=0,
+            )
+
+        (self.cfg.spool_dir / "sources").mkdir(parents=True, exist_ok=True)
+        (self.cfg.spool_dir / "layers").mkdir(parents=True, exist_ok=True)
+
+        stop_event = threading.Event()
+
+        def make_worker() -> FileWorker:
+            return FileWorker(
+                downloader=self.downloader,
+                registry_client=self.registry_client,
+                head_blob_fn=head_blob,
+                streaming_factory=StreamingBlobUpload,
+                layer_prefix=self.cfg.layer_prefix,
+                spool_dir=self.cfg.spool_dir,
+                clean_hf_after_push=self.cfg.clean_hf_after_push,
+                oci_max_retries=self.cfg.oci_max_retries,
+                stop_event=stop_event,
+            )
+
+        descriptors: list[BlobDescriptor] = []
+        failures: list[tuple[str, BaseException]] = []
+
+        with ThreadPoolExecutor(max_workers=self.cfg.workers) as pool:
+            futures: dict[Future[BlobDescriptor], HfFile] = {}
+            for hf_file in files:
+                worker = make_worker()
+                fut = pool.submit(worker.process, self.cfg.hf_repo, revision, hf_file)
+                futures[fut] = hf_file
+
+            for fut in list(futures):
+                hf_file = futures[fut]
+                try:
+                    desc = fut.result()
+                    descriptors.append(desc)
+                except BaseException as e:
+                    failures.append((hf_file.path, e))
+                    if self.cfg.fail_fast:
+                        stop_event.set()
+                        for other in futures:
+                            if not other.done():
+                                other.cancel()
+                        raise
+
+        if failures:
+            self.plog.error(f"{len(failures)} file(s) failed:")
+            for path, exc in failures:
+                self.plog.error(f"  {path}: {type(exc).__name__}: {exc}")
+            raise PartialFailureError(
+                f"{len(failures)}/{len(files)} files failed",
+                hint="re-run; succeeded blobs are cached in registry",
+            )
+
+        return self._assemble_manifest(target_tag, descriptors)
+
+    def _assemble_manifest(self, target_tag: str, descriptors: list[BlobDescriptor]) -> RunResult:
+        """Assemble and push OCI config + manifest. Tag conflict check deferred to Task 8.6."""
+        descriptors.sort(key=lambda d: d.hf_path)
+        diff_ids = [d.digest for d in descriptors]
+        config_bytes = build_config_bytes(diff_ids)
+        config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+        manifest_bytes = build_manifest_bytes(config_digest, len(config_bytes), descriptors)
+        new_manifest_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+
+        push_small_blob(self.registry_client, self.cfg.target_repo, config_bytes)
+        push_manifest(self.registry_client, self.cfg.target_repo, target_tag, manifest_bytes)
+        validate_manifest_tag(
+            self.registry_client, self.cfg.target_repo, target_tag, new_manifest_digest
+        )
+
+        for tag in self.cfg.also_tags:
+            push_manifest(self.registry_client, self.cfg.target_repo, tag, manifest_bytes)
+            validate_manifest_tag(
+                self.registry_client, self.cfg.target_repo, tag, new_manifest_digest
+            )
+
+        image_ref = f"{self.registry_client.host}/{self.cfg.target_repo}:{target_tag}"
+        image_ref_digest = (
+            f"{self.registry_client.host}/{self.cfg.target_repo}@{new_manifest_digest}"
+        )
+        self.plog.info(f"manifest: {new_manifest_digest}")
+        self.plog.info(f"image:    {image_ref}")
+        self.plog.output_variable("manifestDigest", new_manifest_digest)
+        self.plog.output_variable("imageRef", image_ref)
+        self.plog.output_variable("imageRefDigest", image_ref_digest)
+
+        return RunResult(
+            manifest_digest=new_manifest_digest,
+            image_ref=image_ref,
+            image_ref_digest=image_ref_digest,
+            layers=tuple(descriptors),
+        )
