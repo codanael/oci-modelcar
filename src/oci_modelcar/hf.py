@@ -6,6 +6,7 @@ import contextlib
 import http.client
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -112,6 +113,7 @@ class HfStream:
         backoff_initial: float = 1.0,
         backoff_cap: float = 60.0,
         progress_cb: Callable[[int], None] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.client = client
         self.revision = revision
@@ -122,6 +124,7 @@ class HfStream:
         self.backoff_initial = backoff_initial
         self.backoff_cap = backoff_cap
         self.progress_cb = progress_cb
+        self.stop_event = stop_event
         self.bytes_buffered = 0
         self.buf = b""
         self._r: requests.Response | None = None
@@ -174,6 +177,8 @@ class HfStream:
             time.sleep(delay)
 
     def _next_chunk(self) -> bytes | None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError(f"HF read of {self.path} aborted by stop_event")
         for attempt in range(self.max_retries):
             try:
                 if self._it is None:
