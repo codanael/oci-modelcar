@@ -33,6 +33,24 @@ All notable changes to this project will be documented in this file.
   workers retry against a recovering proxy at once — the previous narrow
   10% jitter band invited synchronized retry storms.
 
+### Added (diagnostic)
+- **Three opt-in env vars in `http.py`** to help isolate proxy/AV
+  behavior when `oci-modelcar` fails where `wget` succeeds:
+  - `OCI_MODELCAR_USER_AGENT=...` — override the default UA.
+  - `OCI_MODELCAR_FORCE_CONNECTION_CLOSE=1` — disable HTTP keep-alive.
+  - `OCI_MODELCAR_DEBUG_HTTP=1` — turn on `urllib3` + `http.client`
+    wire-level debug logging (request line, headers sent, response
+    status & headers, connection events, retry telemetry). Substitute
+    for tcpdump when TLS capture is impractical.
+  Defaults unchanged.
+- **`tools/hf_download_probe.py`** — standalone diagnostic that
+  downloads the same URL via wget, curl, and Python `requests`,
+  reporting bytes/time/throughput/error per backend. Levers:
+  `--connection-close`, `--user-agent`, `--chunk-size`,
+  `--range-start/--range-end` (bracket past AV thresholds),
+  `--insecure`, `--max-bytes`, `--debug-http`. Useful in airgapped
+  environments where the failure only reproduces on-site.
+
 ## [0.5.0] - 2026-05-08
 
 ### Added
