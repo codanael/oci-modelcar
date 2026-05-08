@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 from oci_modelcar.config import Config
 from oci_modelcar.hf import HfClient, HfFile, HfStream
-from oci_modelcar.logging import PipelineLogger
+from oci_modelcar.logging import PipelineLogger, ProgressEmitter, _fmt_bytes
 from oci_modelcar.manifest import build_config_bytes, build_manifest_bytes
 from oci_modelcar.oci import (
     ML_CFG,
@@ -156,6 +156,9 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
         return RunResult(job_key=job_key, manifest_digest="", image_ref=image_ref, layers=[])
 
     plog.section(f"Pushing {len(files)} layers ({total_bytes / 1e9:.2f} GB)")
+    for idx, hf_file in enumerate(files):
+        plog.info(f"[{idx + 1:>3}/{len(files)}] {hf_file.path} ({_fmt_bytes(hf_file.size)})")
+
     layers_by_idx: dict[int, BlobDescriptor] = {}
     diff_ids_by_idx: dict[int, str] = {}
     skipped = 0
@@ -181,6 +184,12 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
                 str(cached["diff_id"]),
                 True,  # was_cached
             )
+        emitter = ProgressEmitter(
+            emit=plog.info,
+            path=hf_file.path,
+            total=hf_file.size,
+            interval=5.0,
+        )
         descriptor, diff_id = process_one_file(
             hf_client=hf_client,
             oci_client=oci_client,
@@ -191,6 +200,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             chunk_size=cfg.chunk_bytes,
             hf_max_retries=cfg.hf_max_retries,
             oci_max_retries=cfg.oci_max_retries,
+            progress_cb=emitter.update,
         )
         state.mark_pushed(
             job_key,
@@ -203,47 +213,57 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
         state.save()
         return idx, descriptor, diff_id, False  # freshly pushed
 
+    def record_result(
+        idx: int, path: str, desc: BlobDescriptor, diff: str, was_cached: bool
+    ) -> None:
+        layers_by_idx[idx] = desc
+        diff_ids_by_idx[idx] = diff
+        suffix = " (cached)" if was_cached else ""
+        plog.info(f"{path}: -> {desc.digest[:23]}…{suffix}")
+
     if cfg.workers == 1:
         for idx, hf_file in enumerate(files):
-            with plog.file_scope(
-                f"[{idx + 1:>3}/{len(files)}] {hf_file.path} ({hf_file.size / 1e6:.1f} MB)"
-            ) as scoped:
+            try:
+                _, desc, diff, was_cached = task_for_file(idx, hf_file)
+                record_result(idx, hf_file.path, desc, diff, was_cached)
+                if was_cached:
+                    skipped += 1
+                else:
+                    pushed += 1
+            except Exception as e:
+                plog.error(f"{hf_file.path}: failed: {e}")
+                failed.append(hf_file.path)
+                if cfg.fail_fast:
+                    raise
+    else:
+        pool = ThreadPoolExecutor(max_workers=cfg.workers)
+        future_to_path: dict[Future[tuple[int, BlobDescriptor, str, bool]], str] = {
+            pool.submit(task_for_file, i, f): f.path for i, f in enumerate(files)
+        }
+        try:
+            for fut in as_completed(future_to_path):
+                path = future_to_path[fut]
                 try:
-                    _, desc, diff, was_cached = task_for_file(idx, hf_file)
-                    layers_by_idx[idx] = desc
-                    diff_ids_by_idx[idx] = diff
-                    scoped.info(f"-> {desc.digest[:23]}…")
+                    idx, desc, diff, was_cached = fut.result()
+                    record_result(idx, path, desc, diff, was_cached)
                     if was_cached:
                         skipped += 1
                     else:
                         pushed += 1
                 except Exception as e:
-                    scoped.error(f"failed: {e}")
-                    failed.append(hf_file.path)
-                    if cfg.fail_fast:
-                        raise
-    else:
-        future_to_path: dict[Future[tuple[int, BlobDescriptor, str, bool]], str] = {}
-        with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-            for i, f in enumerate(files):
-                fut = pool.submit(task_for_file, i, f)
-                future_to_path[fut] = f.path
-            for fut in as_completed(future_to_path):
-                path = future_to_path[fut]
-                try:
-                    idx, desc, diff, was_cached = fut.result()
-                    layers_by_idx[idx] = desc
-                    diff_ids_by_idx[idx] = diff
-                    if was_cached:
-                        skipped += 1
-                    else:
-                        pushed += 1
-                except Exception:
+                    plog.error(f"{path}: failed: {e}")
                     failed.append(path)
                     if cfg.fail_fast:
                         for other in future_to_path:
                             other.cancel()
                         raise
+        except KeyboardInterrupt:
+            plog.warning("Interrupted; cancelling pending uploads")
+            for other in future_to_path:
+                other.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     if failed and not cfg.fail_fast:
         raise SystemExit(3)
