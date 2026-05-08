@@ -7,7 +7,7 @@ import http.client
 import logging
 import random
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import requests
@@ -111,6 +111,7 @@ class HfStream:
         max_retries: int = 10,
         backoff_initial: float = 1.0,
         backoff_cap: float = 60.0,
+        progress_cb: Callable[[int], None] | None = None,
     ) -> None:
         self.client = client
         self.revision = revision
@@ -120,6 +121,7 @@ class HfStream:
         self.max_retries = max_retries
         self.backoff_initial = backoff_initial
         self.backoff_cap = backoff_cap
+        self.progress_cb = progress_cb
         self.bytes_buffered = 0
         self.buf = b""
         self._r: requests.Response | None = None
@@ -179,6 +181,8 @@ class HfStream:
                 assert self._it is not None
                 chunk = next(self._it)
                 self.bytes_buffered += len(chunk)
+                if self.progress_cb is not None:
+                    self.progress_cb(self.bytes_buffered)
                 return chunk
             except StopIteration:
                 if self.bytes_buffered >= self.expected_size:

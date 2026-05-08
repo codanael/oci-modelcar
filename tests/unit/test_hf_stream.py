@@ -72,6 +72,39 @@ def test_hfstream_read_in_chunks(httpserver: HTTPServer):
     assert out == payload
 
 
+def test_hfstream_invokes_progress_cb_after_each_chunk(httpserver: HTTPServer):
+    """progress_cb receives cumulative bytes_buffered after every chunk read."""
+    payload = b"X" * 4096
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    client = _make_client(httpserver)
+    seen: list[int] = []
+    stream = HfStream(
+        client,
+        revision="main",
+        path="file.bin",
+        size=len(payload),
+        chunk_size=1024,
+        progress_cb=seen.append,
+    )
+    out = stream.read(-1)
+    assert out == payload
+    # 4096 bytes at 1024-byte chunks → 4 progress calls with cumulative totals
+    assert seen == [1024, 2048, 3072, 4096]
+
+
+def test_hfstream_progress_cb_optional(httpserver: HTTPServer):
+    """No progress_cb → no error, no calls."""
+    payload = b"Y" * 256
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    client = _make_client(httpserver)
+    stream = HfStream(client, revision="main", path="file.bin", size=len(payload))
+    assert stream.read(-1) == payload
+
+
 def test_hfstream_size_mismatch_raises(httpserver: HTTPServer):
     httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
         b"X" * 100, headers={"Content-Length": "100"}
