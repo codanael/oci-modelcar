@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import ssl
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3.exceptions
@@ -61,9 +62,35 @@ class _SmartRetry(Retry):
         return super().increment(method, url, response, error, _pool, _stacktrace)
 
 
+class _SafeSession(requests.Session):
+    """Session that strips Authorization on cross-origin redirects regardless
+    of whether the header was set per-request or via session.headers.
+
+    requests >=2.32 already strips session-level auth; this also handles
+    per-request Authorization headers, which is the common case for
+    HuggingFace LFS file pulls (HF redirects to signed S3/CloudFront URLs
+    that we must not give the Bearer token to)."""
+
+    def rebuild_auth(
+        self,
+        prepared_request: requests.PreparedRequest,
+        response: requests.Response,
+    ) -> None:
+        super().rebuild_auth(prepared_request, response)  # type: ignore[no-untyped-call]
+        if "Authorization" not in prepared_request.headers:
+            return
+        original_url = response.request.url
+        if original_url is None:
+            return
+        original_netloc = urlparse(original_url).netloc
+        new_netloc = urlparse(prepared_request.url or "").netloc
+        if new_netloc and new_netloc != original_netloc:
+            del prepared_request.headers["Authorization"]
+
+
 def build_session() -> requests.Session:
     """Single source of truth for HTTP sessions across the codebase."""
-    s = requests.Session()
+    s = _SafeSession()
     retry = _SmartRetry(
         total=8,
         backoff_factor=2,
