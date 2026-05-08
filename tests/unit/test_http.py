@@ -3,6 +3,7 @@ import json
 import ssl
 
 import pytest
+import requests
 import urllib3.exceptions
 
 from oci_modelcar.http import (
@@ -10,6 +11,7 @@ from oci_modelcar.http import (
     build_session,
     docker_config_auth,
     huggingface_token,
+    is_transient_ssl,
     oci_auth_header,
 )
 
@@ -236,3 +238,47 @@ def test_build_session_uses_smart_retry():
     s = build_session()
     adapter = s.get_adapter("https://example/")
     assert isinstance(adapter.max_retries, _SmartRetry)
+
+
+def test_is_transient_ssl_message_string():
+    """The canonical OpenSSL message is enough on its own (no chain required)."""
+    e = requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2437)")
+    assert is_transient_ssl(e) is True
+
+
+def test_is_transient_ssl_via_explicit_cause():
+    """`raise SSLError(...) from ssl.SSLEOFError(...)` exposes the inner type
+    via __cause__; isinstance walk must catch it even when the outer message
+    doesn't carry the marker string."""
+    inner = ssl.SSLEOFError("inner eof")
+    outer: requests.exceptions.SSLError
+    try:
+        raise requests.exceptions.SSLError("connection lost") from inner
+    except requests.exceptions.SSLError as e:
+        outer = e
+    assert is_transient_ssl(outer) is True
+
+
+def test_is_transient_ssl_via_implicit_context():
+    """Common urllib3/requests pattern: raise inside an except without `from`.
+    __cause__ stays None but __context__ holds the original SSLEOFError."""
+    outer: requests.exceptions.SSLError
+    try:
+        try:
+            raise ssl.SSLEOFError("inner eof")
+        except ssl.SSLEOFError:
+            raise requests.exceptions.SSLError("wrapped, no from clause")  # noqa: B904
+    except requests.exceptions.SSLError as e:
+        outer = e
+    assert is_transient_ssl(outer) is True
+
+
+def test_is_transient_ssl_handshake_error_is_not_transient():
+    """A pure CA/cert SSLError stays fatal."""
+    e = requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
+    assert is_transient_ssl(e) is False
+
+
+def test_is_transient_ssl_unrelated_exception_is_not_transient():
+    e = RuntimeError("not even an SSL error")
+    assert is_transient_ssl(e) is False

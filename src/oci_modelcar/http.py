@@ -26,7 +26,7 @@ _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
 )
 
 
-def _is_transient_ssl(exc: BaseException) -> bool:
+def is_transient_ssl(exc: BaseException) -> bool:
     """True if `exc` is an SSL error whose root cause is a mid-stream EOF
     (the connection got cut after the handshake succeeded), as opposed to a
     handshake-time misconfig (CA invalid, hostname mismatch, expired cert).
@@ -34,9 +34,15 @@ def _is_transient_ssl(exc: BaseException) -> bool:
     Mid-stream EOFs happen on long transfers when an idle proxy or firewall
     rotates or times out the TCP connection — fully recoverable via Range
     resume / OCI session resync, so they must be retried like any other
-    transient cut. Used by `HfStream._next_chunk` and
-    `ChunkedBlobUpload._patch_with_retry` to override the default
+    transient cut. Public to the package: consumed by `HfStream._next_chunk`
+    and `ChunkedBlobUpload._patch_with_retry` to override the default
     fatal-on-SSLError verdict for this specific case.
+
+    Walks both `__cause__` (explicit `raise ... from ...`) and `__context__`
+    (implicit re-raise inside an except block, the common urllib3/requests
+    wrapping pattern) to find the underlying `ssl.SSLEOFError`. Falls back
+    to a string match on the canonical SSL error message because some
+    wrappers re-raise without preserving the chain.
     """
     cur: BaseException | None = exc
     seen: set[int] = set()
@@ -46,7 +52,7 @@ def _is_transient_ssl(exc: BaseException) -> bool:
             return True
         if "EOF occurred in violation of protocol" in str(cur):
             return True
-        cur = cur.__cause__
+        cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
     return False
 
 

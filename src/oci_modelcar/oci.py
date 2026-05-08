@@ -12,7 +12,7 @@ from functools import cached_property
 
 import requests
 
-from oci_modelcar.http import _is_transient_ssl, build_session, oci_auth_header
+from oci_modelcar.http import build_session, is_transient_ssl, oci_auth_header
 
 log = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class ChunkedBlobUpload:
                 # Cert / proxy misconfig never recovers. But an SSL EOF after
                 # bytes already flowed is a mid-stream connection cut — treat
                 # like any other transient: backoff + resync + retry.
-                if isinstance(e, requests.exceptions.SSLError) and _is_transient_ssl(e):
+                if isinstance(e, requests.exceptions.SSLError) and is_transient_ssl(e):
                     log.warning(
                         "PATCH SSL EOF [%d-%d] attempt %d, resyncing", start, end, attempt + 1
                     )

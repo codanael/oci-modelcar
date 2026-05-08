@@ -206,6 +206,37 @@ def test_hfstream_retries_on_ssl_eof_mid_stream(httpserver: HTTPServer):
     assert call_count["n"] >= 2, "must have retried after SSL EOF"
 
 
+def test_hfstream_ssl_eof_exhausts_retries(httpserver: HTTPServer):
+    """If the SSL EOF is permanent (every attempt cuts), the retry loop still
+    bails after max_retries with a clean RuntimeError instead of looping
+    forever."""
+    payload = b"A" * 100
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    iter_calls = {"n": 0}
+
+    def always_eof(self: requests.Response, chunk_size: int = 1) -> Any:
+        iter_calls["n"] += 1
+        raise requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2437)")
+        yield  # pragma: no cover
+
+    client = _make_client(httpserver)
+    with patch.object(requests.Response, "iter_content", always_eof):
+        stream = HfStream(
+            client,
+            revision="main",
+            path="file.bin",
+            size=len(payload),
+            max_retries=3,
+            backoff_initial=0.0,
+            chunk_size=10,
+        )
+        with pytest.raises(RuntimeError, match="HF retries exhausted"):
+            stream.read(-1)
+    assert iter_calls["n"] == 3
+
+
 def test_hfstream_does_not_retry_on_proxy_error(httpserver: HTTPServer):
     payload = b"Y" * 100
     httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
