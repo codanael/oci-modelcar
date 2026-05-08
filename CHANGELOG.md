@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Lowered minimum Python version from 3.14 to **3.11**. The codebase only
+  relied on `typing.Self` and `datetime.UTC` (both 3.11+); no 3.12+ syntax
+  was in use. Verified with the full unit + integration suite (97 tests)
+  and `mypy --strict` on Python 3.11, 3.12, 3.13, and 3.14. `requires-python`,
+  `tool.ruff.target-version`, `tool.mypy.python_version`, and the trove
+  classifiers were all updated together.
+- CI now runs the test job as a matrix over Python 3.11–3.14
+  (`fail-fast: false`). The lint job stays pinned to 3.14 since mypy is
+  already targeting 3.11 via `pyproject.toml`.
+- Bumped all JavaScript GitHub Actions to Node.js 24 runtimes ahead of the
+  Node 20 deprecation (June 2026): `actions/checkout` v4→v6,
+  `actions/setup-python` v5→v6, `actions/upload-artifact` v4→v7,
+  `actions/download-artifact` v4→v8, `softprops/action-gh-release` v2→v3.
+
 ## [0.2.1] - 2026-05-08
 
 ### Fixed
