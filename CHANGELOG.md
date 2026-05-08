@@ -5,17 +5,21 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- **PATCH `200 OK` is now treated as success (Artifactory quirk).** The OCI
-  Distribution v1.1 spec mandates `202 Accepted` on a chunk commit, but
-  Artifactory is observed to return `200 OK` instead. The previous code
-  matched only `202`, fell through `raise_for_status()` (a no-op on 2xx),
-  and re-iterated the retry loop without advancing `server_offset` or
+- **PATCH chunk commit accepts `200`/`201`/`202`/`204` (was `202` only).**
+  OCI Distribution v1.1 mandates `202 Accepted` on chunk commit, but real
+  registries diverge: Artifactory returns `200` or `204`, and Harbor
+  behind reverse proxies has been observed returning `204`. The two
+  canonical OCI client libraries already handle this — go-containerregistry
+  (`streamBlob`) accepts `{201, 202, 204}`, oras-py (`_check_200_response`)
+  accepts `{200, 201, 202}` — but `oci-modelcar` matched only `202`. A
+  non-202 success fell through `raise_for_status()` (a no-op on 2xx) and
+  re-iterated the retry loop without advancing `server_offset` or
   decrementing `attempts_left` — an infinite re-PATCH of the same range,
   burning bandwidth until a middlebox cut the TLS connection mid-stream
   (presenting as a misleading "PATCH SSL EOF, retries exhausted" error).
-  `_patch_with_retry` now accepts `200` like `202`. Also adds a guard:
-  any unexpected non-spec status (other 2xx/3xx) raises explicitly
-  rather than silently spinning.
+  `_patch_with_retry` now accepts the union `{200, 201, 202, 204}`. Also
+  adds a guard: any unexpected non-spec status (other 2xx/3xx) raises
+  explicitly rather than silently spinning.
 - **PATCH retry no longer loops on 416 after partial server commit.** When a
   transient PATCH failure (SSL EOF, 5xx, ChunkedEncodingError) coincided
   with the registry committing some bytes server-side, the retry was

@@ -179,12 +179,18 @@ class ChunkedBlobUpload:
                 r = self.client.session.patch(
                     self.location, data=slice_chunk, headers=hdr, timeout=600
                 )
-                # Spec says 202; Artifactory has been observed to return 200
-                # on chunk commit. Treat both as success. Without this, a 200
-                # falls through `raise_for_status()` (no-op on 2xx) and re-
-                # iterates without progress or budget decrement → infinite
-                # re-PATCH of the same range.
-                if r.status_code in (200, 202):
+                # Spec (OCI Distribution v1.1) says 202 on chunk commit, but
+                # real registries diverge: Artifactory returns 200 or 204,
+                # Harbor under some reverse-proxy setups returns 204. The two
+                # canonical OCI client libs handle this — go-containerregistry
+                # (`streamBlob`) accepts {201, 202, 204}, oras-py
+                # (`_check_200_response`) accepts {200, 201, 202}. Union is
+                # {200, 201, 202, 204}; we accept all four. Without this, a
+                # non-202 success falls through `raise_for_status()` (no-op
+                # on 2xx) and re-iterates the loop without advancing
+                # `server_offset` or decrementing `attempts_left` — an
+                # infinite re-PATCH of the same range.
+                if r.status_code in (200, 201, 202, 204):
                     self.location = r.headers.get("Location", self.location)
                     self.server_offset = target_end + 1
                     return

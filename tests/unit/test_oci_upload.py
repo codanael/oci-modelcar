@@ -223,12 +223,20 @@ def test_retry_budget_resets_when_server_makes_progress(httpserver: HTTPServer):
     )
 
 
-def test_patch_200_treated_as_success_artifactory_quirk(httpserver: HTTPServer):
-    """OCI Distribution v1.1 says PATCH must return 202; Artifactory has been
-    observed to return 200 on chunk commit. Both must be treated as success.
-    Otherwise the retry loop falls through without advancing server_offset
-    or decrementing attempts_left, causing infinite re-PATCH of the same
-    range (or, when the server re-checks, a 416 storm)."""
+@pytest.mark.parametrize("success_status", [200, 201, 202, 204])
+def test_patch_non_spec_success_codes_accepted(httpserver: HTTPServer, success_status: int):
+    """OCI Distribution v1.1 says PATCH chunk commit must return 202, but
+    real registries diverge:
+
+    - Artifactory has been observed to return 200 OK or 204 No Content.
+    - go-containerregistry's streamBlob accepts 201/202/204.
+    - oras-py's _check_200_response accepts 200/201/202.
+
+    Union: {200, 201, 202, 204}. We must treat all four as commit success
+    on PATCH, otherwise a non-202 response falls through `raise_for_status()`
+    (no-op on 2xx) and re-iterates the retry loop without advancing
+    `server_offset` or decrementing `attempts_left` — an infinite re-PATCH
+    of the same range (or a 416 storm if the server re-checks)."""
     payload = b"A" * 200
 
     httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
@@ -245,10 +253,9 @@ def test_patch_200_treated_as_success_artifactory_quirk(httpserver: HTTPServer):
         assert m
         end = int(m.group(2))
         received.extend(request.data)
-        # 200 instead of 202 — the Artifactory non-conformance we're testing.
         return Response(
             "",
-            status=200,
+            status=success_status,
             headers={
                 "Location": httpserver.url_for("/upload/jfrog"),
                 "Range": f"0-{end}",
@@ -266,20 +273,21 @@ def test_patch_200_treated_as_success_artifactory_quirk(httpserver: HTTPServer):
     upload.close()
 
     # 200 bytes / 64-byte chunks → 3 PATCH (64+64+64) + remainder via PUT.
-    # If 200 isn't accepted, we'd see >3 attempts (re-PATCH) or a hang.
+    # If the status isn't accepted, we'd see >3 attempts (re-PATCH) or a hang.
     assert patch_count["n"] == 3, (
-        f"200 must be treated as success — one PATCH per chunk; got {patch_count['n']}"
+        f"status {success_status} must be treated as success — one PATCH "
+        f"per chunk; got {patch_count['n']}"
     )
     assert bytes(received) == payload[:192]
 
 
 def test_unhandled_patch_status_raises_instead_of_looping(httpserver: HTTPServer):
     """Belt-and-braces: any status the loop doesn't explicitly handle must
-    surface as an error, not silently spin. Before the 200 fix, a 2xx
-    non-202/non-200 response would fall through `raise_for_status()` (no-op
+    surface as an error, not silently spin. Before the fix, a 2xx response
+    outside the accepted set would fall through `raise_for_status()` (no-op
     on 2xx) and re-iterate without progress or budget decrement → infinite
     loop. We pick 299 (a 2xx code with no spec meaning) to confirm we no
-    longer trust 'anything 2xx that isn't 202'."""
+    longer trust 'anything 2xx that isn't in the accepted set'."""
     httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
         "", status=202, headers={"Location": httpserver.url_for("/upload/weird")}
     )
