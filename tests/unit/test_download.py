@@ -6,7 +6,7 @@ from huggingface_hub import HfApi
 from pytest_httpserver import HTTPServer
 
 from oci_modelcar.download import HfDownloader, HfFile
-from oci_modelcar.errors import DownloadError
+from oci_modelcar.errors import DownloadError, EntryNotFoundError, GatedRepoError
 from oci_modelcar.http import build_session
 
 
@@ -221,3 +221,60 @@ def test_download_handles_range_200_fallback(
     monkeypatch.setattr("oci_modelcar.download.time.sleep", lambda _d: None)
     out = d.download("repo", "main", f)
     assert out.read_bytes() == payload
+
+
+def test_download_gated_repo_raises_specific_error(httpserver: HTTPServer, tmp_path: Path) -> None:
+    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data(
+        "Gated", status=403, headers={"X-Error-Code": "GatedRepo"}
+    )
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="file.bin", size=10, lfs_sha256=None)
+
+    with pytest.raises(GatedRepoError) as exc:
+        d.download("repo", "main", f)
+    assert exc.value.hint and "huggingface.co/repo" in exc.value.hint
+
+
+def test_download_404_on_resolve_raises_entry_not_found(
+    httpserver: HTTPServer, tmp_path: Path
+) -> None:
+    httpserver.expect_request("/repo/resolve/main/missing.bin").respond_with_data(
+        "Not found", status=404
+    )
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="missing.bin", size=10, lfs_sha256=None)
+
+    with pytest.raises(EntryNotFoundError):
+        d.download("repo", "main", f)
+
+
+def test_download_lfs_sha_verified(httpserver: HTTPServer, tmp_path: Path) -> None:
+    import hashlib
+
+    payload = b"hello world"
+    correct_sha = hashlib.sha256(payload).hexdigest()
+    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="file.bin", size=len(payload), lfs_sha256=correct_sha)
+
+    result = d.download("repo", "main", f)
+    assert result.read_bytes() == payload
+
+
+def test_download_lfs_sha_mismatch_raises(httpserver: HTTPServer, tmp_path: Path) -> None:
+    payload = b"hello world"
+    wrong_sha = "0" * 64
+    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="file.bin", size=len(payload), lfs_sha256=wrong_sha)
+
+    with pytest.raises(DownloadError, match="sha256 mismatch"):
+        d.download("repo", "main", f)
