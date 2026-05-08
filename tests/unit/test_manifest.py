@@ -1,10 +1,13 @@
 import hashlib
 import json
 
+import pytest
+
 from oci_modelcar.manifest import (
     BlobDescriptor,
     build_config_bytes,
     build_manifest_bytes,
+    derive_tag,
 )
 
 
@@ -76,3 +79,32 @@ def test_manifest_bytes_reproducible():
     b = build_manifest_bytes("sha256:" + "c" * 64, 50, layers)
     assert a == b
     assert hashlib.sha256(a).digest() == hashlib.sha256(b).digest()
+
+
+def test_derive_tag_from_40char_sha():
+    sha = "9fb191250dd56d0ba7ec9785a025ed29c03d5998"
+    assert derive_tag(sha, explicit=None) == "9fb191250dd5"
+
+
+def test_derive_tag_explicit_overrides():
+    assert derive_tag("ignored", explicit="v1.0") == "v1.0"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("main", "main"),
+        ("feature/x", "feature-x"),
+        ("v1.0.0", "v1.0.0"),
+        ("Hello World", "hello-world"),
+        ("trailing/", "trailing"),
+    ],
+)
+def test_derive_tag_sanitizes_non_sha(raw, expected):
+    assert derive_tag(raw, explicit=None) == expected
+
+
+def test_derive_tag_explicit_validated():
+    """Explicit tag is taken as-is; the caller (Config.validate) enforces
+    OCI tag rules. derive_tag does not re-validate."""
+    assert derive_tag("any", explicit="raw_input") == "raw_input"
