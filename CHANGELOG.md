@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-08
+
 ### Added
 - **Auth-source visibility.** `oci_auth_header` now logs an `INFO` line on
   successful resolution (`OCI auth resolved from <env|path>`) and a
