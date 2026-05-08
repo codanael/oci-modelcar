@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-08
+
 ### Changed
 - Lowered minimum Python version from 3.14 to **3.11**. The codebase only
   relied on `typing.Self` and `datetime.UTC` (both 3.11+); no 3.12+ syntax
