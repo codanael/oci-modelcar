@@ -102,6 +102,45 @@ def test_build_session_force_connection_close_falsy_values_ignored(monkeypatch):
     assert s.headers.get("Connection", "").lower() != "close"
 
 
+def test_build_session_debug_http_via_env(monkeypatch):
+    """OCI_MODELCAR_DEBUG_HTTP=1 turns on urllib3 + http.client wire-level
+    debug logging — invaluable when diagnosing proxy/AV behavior in an
+    airgapped environment where you can't easily run tcpdump."""
+    import http.client
+    import logging as _logging
+
+    import oci_modelcar.http as _http_mod
+
+    monkeypatch.setenv("OCI_MODELCAR_DEBUG_HTTP", "1")
+    monkeypatch.setattr(_http_mod, "_HTTP_DEBUG_ENABLED", False, raising=False)
+    original_debuglevel = http.client.HTTPConnection.debuglevel
+    original_urllib3_level = _logging.getLogger("urllib3").level
+    try:
+        build_session()
+        assert http.client.HTTPConnection.debuglevel == 1
+        assert _logging.getLogger("urllib3").level == _logging.DEBUG
+    finally:
+        http.client.HTTPConnection.debuglevel = original_debuglevel
+        _logging.getLogger("urllib3").setLevel(original_urllib3_level)
+
+
+def test_build_session_debug_http_disabled_by_default(monkeypatch):
+    """No env var: leave http.client and urllib3 untouched."""
+    import http.client
+
+    import oci_modelcar.http as _http_mod
+
+    monkeypatch.delenv("OCI_MODELCAR_DEBUG_HTTP", raising=False)
+    monkeypatch.setattr(_http_mod, "_HTTP_DEBUG_ENABLED", False, raising=False)
+    original = http.client.HTTPConnection.debuglevel
+    http.client.HTTPConnection.debuglevel = 0
+    try:
+        build_session()
+        assert http.client.HTTPConnection.debuglevel == 0
+    finally:
+        http.client.HTTPConnection.debuglevel = original
+
+
 def test_docker_config_auth_handles_missing(tmp_path):
     assert docker_config_auth(tmp_path / "missing.json", "x") is None
 

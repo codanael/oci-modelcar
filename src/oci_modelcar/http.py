@@ -25,6 +25,40 @@ _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
     urllib3.exceptions.ProxyError,
 )
 
+_HTTP_DEBUG_ENABLED = False
+
+
+def _maybe_enable_http_debug() -> None:
+    """Wire-level HTTP debug logging, opt-in via ``OCI_MODELCAR_DEBUG_HTTP=1``.
+
+    Sets ``http.client.HTTPConnection.debuglevel = 1`` (prints every request
+    line, request headers, response status, response headers to stdout) and
+    raises the ``urllib3`` logger to DEBUG (connection-level events like
+    "Starting new HTTPS connection", "Resetting dropped connection",
+    retry telemetry).
+
+    Diagnostic substitute for tcpdump when you can't easily capture packets
+    or decrypt TLS in an airgapped environment.
+
+    Idempotent: only flips state once per process — repeated build_session()
+    calls are no-ops after the first.
+    """
+    global _HTTP_DEBUG_ENABLED
+    if _HTTP_DEBUG_ENABLED:
+        return
+    if os.environ.get("OCI_MODELCAR_DEBUG_HTTP", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    import http.client
+
+    http.client.HTTPConnection.debuglevel = 1
+    logging.getLogger("urllib3").setLevel(logging.DEBUG)
+    _HTTP_DEBUG_ENABLED = True
+
 
 def is_transient_ssl(exc: BaseException) -> bool:
     """True if `exc` is an SSL error whose root cause is a mid-stream EOF
@@ -94,7 +128,11 @@ def build_session() -> requests.Session:
       on every request, disabling keep-alive. Useful when a proxy
       mishandles long-lived TLS connections (mid-stream EOF after AV
       pass-through threshold, idle eviction, etc.).
+    - ``OCI_MODELCAR_DEBUG_HTTP=1``: enable urllib3 + ``http.client``
+      wire-level debug logging. Substitute for tcpdump when you can't
+      easily capture or decrypt TLS in an airgapped environment.
     """
+    _maybe_enable_http_debug()
     s = requests.Session()
     retry = _SmartRetry(
         total=8,
