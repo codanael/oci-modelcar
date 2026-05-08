@@ -265,10 +265,13 @@ class ChunkedBlobUpload:
             self.server_offset = 0
 
     def _sleep_backoff(self, attempt: int) -> None:
-        delay = min(self.backoff_cap, self.backoff_initial * (2**attempt))
-        delay += random.uniform(0, delay * 0.1)
-        if delay > 0:
-            time.sleep(delay)
+        # Full-jitter pattern (https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/):
+        # sleep ~ Uniform(0, min(cap, base * 2^attempt)). Wider spread than
+        # exponential-plus-additive-jitter — necessary when many clients all
+        # retry against a recovering proxy at once.
+        cap_delay = min(self.backoff_cap, self.backoff_initial * (2**attempt))
+        if cap_delay > 0:
+            time.sleep(random.uniform(0, cap_delay))
 
     def close(self) -> tuple[str, int]:
         digest = "sha256:" + self.h.hexdigest()

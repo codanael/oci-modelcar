@@ -253,6 +253,58 @@ def test_chunked_upload_does_not_retry_on_proxy_error(httpserver: HTTPServer):
     assert calls["n"] == 1
 
 
+def test_backoff_uses_full_jitter(httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch):
+    """Full-jitter pattern (AWS Architecture Blog): each retry sleeps for a
+    random duration in [0, min(cap, base * 2^attempt)], not the previous
+    exponential-plus-10%-jitter. Wider spread = better behavior under
+    thundering-herd / proxy-restart scenarios where many clients retry
+    simultaneously."""
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/jit")}
+    )
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client, repo="repo", chunk_size=64, backoff_initial=1.0, backoff_cap=60.0
+    )
+
+    uniform_calls: list[tuple[float, float]] = []
+
+    def fake_uniform(a: float, b: float) -> float:
+        uniform_calls.append((a, b))
+        return (a + b) / 2
+
+    monkeypatch.setattr("oci_modelcar.oci.random.uniform", fake_uniform)
+    monkeypatch.setattr("oci_modelcar.oci.time.sleep", lambda d: None)
+
+    upload._sleep_backoff(0)  # cap = 1 * 2^0 = 1
+    upload._sleep_backoff(3)  # cap = 1 * 2^3 = 8
+    upload._sleep_backoff(10)  # cap = min(60, 1024) = 60
+
+    assert uniform_calls == [(0.0, 1.0), (0.0, 8.0), (0.0, 60.0)], (
+        f"full jitter must sample uniformly from 0 to capped exponential; got {uniform_calls}"
+    )
+
+
+def test_backoff_zero_initial_does_not_sleep(
+    httpserver: HTTPServer, monkeypatch: pytest.MonkeyPatch
+):
+    """backoff_initial=0 (the test-only fast-path) must not call time.sleep."""
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/zero")}
+    )
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client, repo="repo", chunk_size=64, backoff_initial=0.0, backoff_cap=60.0
+    )
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("oci_modelcar.oci.time.sleep", lambda d: sleep_calls.append(d))
+
+    upload._sleep_backoff(0)
+    upload._sleep_backoff(5)
+    assert sleep_calls == [], f"backoff_initial=0 must skip sleep entirely; got {sleep_calls}"
+
+
 def test_patch_content_range_is_inclusive(httpserver: HTTPServer):
     payload = b"Z" * 200
     seen: list[tuple[int, int, int]] = []
