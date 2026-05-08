@@ -139,38 +139,49 @@ class ChunkedBlobUpload:
             raise InterruptedError(
                 f"OCI upload to {self.repo} aborted by stop_event at offset {self.server_offset}"
             )
-        start = self.server_offset
-        end = start + len(chunk) - 1
+        # The chunk owns the byte range [initial_offset .. target_end] of the
+        # blob, fixed at entry. As the server commits partial bytes (visible
+        # via _resync), each retry re-slices the chunk so we never re-send
+        # already-acked bytes — otherwise the server returns 416 forever.
+        initial_offset = self.server_offset
+        target_end = initial_offset + len(chunk) - 1
         for attempt in range(self.max_retries):
+            bytes_done = self.server_offset - initial_offset
+            if bytes_done >= len(chunk):
+                return
+            slice_chunk = chunk[bytes_done:]
+            slice_start = self.server_offset
             try:
                 hdr = {
                     **self.client.auth,
                     "Content-Type": "application/octet-stream",
-                    "Content-Range": f"{start}-{end}",  # OCI: inclusive, no "bytes " prefix
-                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"{slice_start}-{target_end}",  # OCI: inclusive, no "bytes " prefix
+                    "Content-Length": str(len(slice_chunk)),
                 }
-                r = self.client.session.patch(self.location, data=chunk, headers=hdr, timeout=600)
+                r = self.client.session.patch(
+                    self.location, data=slice_chunk, headers=hdr, timeout=600
+                )
                 if r.status_code == 202:
                     self.location = r.headers.get("Location", self.location)
-                    self.server_offset = end + 1
+                    self.server_offset = target_end + 1
                     return
                 if r.status_code == 416:
-                    log.warning("PATCH 416 at [%d-%d], resyncing", start, end)
+                    log.warning("PATCH 416 at [%d-%d], resyncing", slice_start, target_end)
                     self._resync()
-                    if self.server_offset >= end + 1:
+                    if self.server_offset >= target_end + 1:
                         return
                     continue
                 if r.status_code in (408, 429) or 500 <= r.status_code < 600:
                     log.warning(
                         "PATCH transient %d at [%d-%d] attempt %d",
                         r.status_code,
-                        start,
-                        end,
+                        slice_start,
+                        target_end,
                         attempt + 1,
                     )
                     self._sleep_backoff(attempt)
                     self._resync()
-                    if self.server_offset >= end + 1:
+                    if self.server_offset >= target_end + 1:
                         return
                     continue
                 r.raise_for_status()
@@ -180,11 +191,14 @@ class ChunkedBlobUpload:
                 # like any other transient: backoff + resync + retry.
                 if isinstance(e, requests.exceptions.SSLError) and is_transient_ssl(e):
                     log.warning(
-                        "PATCH SSL EOF [%d-%d] attempt %d, resyncing", start, end, attempt + 1
+                        "PATCH SSL EOF [%d-%d] attempt %d, resyncing",
+                        slice_start,
+                        target_end,
+                        attempt + 1,
                     )
                     self._sleep_backoff(attempt)
                     self._resync()
-                    if self.server_offset >= end + 1:
+                    if self.server_offset >= target_end + 1:
                         return
                     continue
                 raise
@@ -193,12 +207,21 @@ class ChunkedBlobUpload:
                 requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError,
             ) as e:
-                log.warning("PATCH failed [%d-%d] attempt %d: %s", start, end, attempt + 1, e)
+                log.warning(
+                    "PATCH failed [%d-%d] attempt %d: %s",
+                    slice_start,
+                    target_end,
+                    attempt + 1,
+                    e,
+                )
                 self._sleep_backoff(attempt)
                 self._resync()
-                if self.server_offset >= end + 1:
+                if self.server_offset >= target_end + 1:
                     return
-        raise RuntimeError(f"PATCH retries exhausted at offset {start} (chunk [{start}-{end}])")
+        raise RuntimeError(
+            f"PATCH retries exhausted at offset {self.server_offset} "
+            f"(target {target_end}, started at {initial_offset})"
+        )
 
     def _resync(self) -> None:
         r = self.client.session.get(self.location, headers=self.client.auth, timeout=30)
