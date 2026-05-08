@@ -142,7 +142,23 @@ class HfDownloader:
                             )
                     return
             except requests.exceptions.HTTPError as e:
-                self._raise_specific_http_error(e, repo, revision, hf_file.path)
+                status = e.response.status_code if e.response is not None else 0
+                if status in (403, 404):
+                    self._raise_specific_http_error(e, repo, revision, hf_file.path)
+                # Transient HTTP error (5xx, 408, 429, etc.) — retry
+                log.warning(
+                    "HF HTTP %d for %s at %d/%d (attempt %d/%d): %s",
+                    status,
+                    hf_file.path,
+                    bytes_done,
+                    hf_file.size,
+                    attempt + 1,
+                    self.max_retries,
+                    e,
+                )
+                bytes_done = partial.stat().st_size if partial.exists() else 0
+                self._sleep_backoff(attempt)
+                continue
             except _FATAL_TRANSPORT_ERRORS as e:
                 if isinstance(e, requests.exceptions.SSLError) and is_transient_ssl(e):
                     log.warning(

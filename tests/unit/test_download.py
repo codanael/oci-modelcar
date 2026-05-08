@@ -1,6 +1,32 @@
+from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+from huggingface_hub import HfApi
+from pytest_httpserver import HTTPServer
+
 from oci_modelcar.download import HfDownloader, HfFile
+from oci_modelcar.errors import DownloadError
+from oci_modelcar.http import build_session
+
+
+def _make_downloader(httpserver: HTTPServer, spool: Path) -> HfDownloader:
+    api = HfApi(endpoint=httpserver.url_for(""))
+    # Use a session with no urllib3 retries so test-level max_retries drives the loop
+    session = build_session()
+    session.adapters.clear()
+    from requests.adapters import HTTPAdapter as _Adapter
+
+    session.mount("http://", _Adapter(max_retries=0))
+    session.mount("https://", _Adapter(max_retries=0))
+    return HfDownloader(
+        api=api,
+        session=session,
+        spool_dir=spool,
+        stop_event=None,
+        max_retries=3,
+        backoff_initial=0.0,
+    )
 
 
 def test_hf_file_carries_metadata():
@@ -57,3 +83,63 @@ def test_list_files_extracts_lfs_sha256():
     by_path = {f.path: f for f in files}
     assert by_path["model.safetensors"].lfs_sha256 == "b" * 64
     assert by_path["config.json"].lfs_sha256 is None
+
+
+def test_download_writes_file_and_returns_path(httpserver: HTTPServer, tmp_path: Path) -> None:
+    payload = b"hello world"
+    httpserver.expect_request("/repo/resolve/main/file.txt").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="file.txt", size=len(payload), lfs_sha256=None)
+
+    result = d.download("repo", "main", f)
+    assert result == spool / "sources" / "file.txt"
+    assert result.read_bytes() == payload
+    assert not (spool / "sources" / "file.txt.partial").exists()
+
+
+def test_download_preserves_subdirs_in_hf_path(httpserver: HTTPServer, tmp_path: Path) -> None:
+    payload = b"sub"
+    httpserver.expect_request("/repo/resolve/main/subdir/inner.txt").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="subdir/inner.txt", size=len(payload), lfs_sha256=None)
+
+    result = d.download("repo", "main", f)
+    assert result == spool / "sources" / "subdir" / "inner.txt"
+    assert result.read_bytes() == payload
+
+
+def test_download_calls_progress_cb(httpserver: HTTPServer, tmp_path: Path) -> None:
+    payload = b"X" * 4096
+    httpserver.expect_request("/repo/resolve/main/big.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="big.bin", size=len(payload), lfs_sha256=None)
+
+    seen: list[int] = []
+    d.download("repo", "main", f, progress_cb=seen.append)
+    assert seen, "progress_cb was never invoked"
+    assert seen[-1] == len(payload)
+
+
+def test_download_partial_file_cleaned_on_exception(httpserver: HTTPServer, tmp_path: Path) -> None:
+    """If the GET fails repeatedly, the .partial file is removed."""
+    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data("", status=503)
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="file.bin", size=10, lfs_sha256=None)
+
+    with pytest.raises(DownloadError):
+        d.download("repo", "main", f)
+    partial = spool / "sources" / "file.bin.partial"
+    final = spool / "sources" / "file.bin"
+    assert not partial.exists() and not final.exists()
