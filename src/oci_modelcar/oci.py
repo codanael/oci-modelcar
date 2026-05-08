@@ -8,6 +8,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
+from functools import cached_property
 
 import requests
 
@@ -49,6 +50,7 @@ class OciClient:
         host_url: str | None = None,
         registry_host: str | None = None,
         session: requests.Session | None = None,
+        target_repo: str | None = None,
     ) -> None:
         if host_url is not None:
             self.base = host_url.rstrip("/")
@@ -65,10 +67,13 @@ class OciClient:
             else:
                 self.base = f"https://{registry_host}"
         self.session = session if session is not None else build_session()
+        self.target_repo = target_repo
 
-    @property
+    @cached_property
     def auth(self) -> dict[str, str]:
-        return oci_auth_header(self.host)
+        # Resolved once per client; the source-resolution log fires only on
+        # first access, not on every PATCH chunk.
+        return oci_auth_header(self.host, target_repo=self.target_repo)
 
     def url(self, *parts: str) -> str:
         return f"{self.base}/v2/" + "/".join(parts)
