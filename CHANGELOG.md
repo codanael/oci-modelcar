@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-08
+
 ### Added
 - **Pipelined HF download / OCI push.** `process_one_file` now runs the HF
   read + tar wrapping on a producer thread and the OCI PATCH stream on
