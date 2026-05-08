@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Live per-file upload progress** during `push`. Each tracked file emits
+  a `<path>: NN% (<transferred> / <total>)` line at most once every 5 s
+  while its layer streams, with GB/MB/KB scaling. The cumulative byte
+  count flows from `HfStream` through `process_one_file` via a new
+  `progress_cb: Callable[[int], None] | None` callback, throttled by the
+  new `ProgressEmitter` helper in `oci_modelcar.logging`.
+- Per-file headers and result lines in **multi-worker mode**. Previously
+  `--workers >1` was completely silent between the `Pushing N layers`
+  banner and the manifest section. Now all `[N/total] <path> (<size>)`
+  headers are emitted in alphabetical order before any worker starts,
+  and each worker prints `<path>: -> sha256:digest…` (or
+  `<path>: failed: …` on error) on completion.
+
+### Changed
+- The mono-worker logging path is unified with multi-worker — the
+  per-file `file_scope` buffer (which suppressed all output until the
+  layer finished) is replaced by direct, path-prefixed emits, so live
+  progress is visible in both modes.
+
+### Fixed
+- **Ctrl+C is now responsive in multi-worker mode.** Previously the
+  `with ThreadPoolExecutor(...)` context manager called
+  `pool.shutdown(wait=True)` on the way out of a `KeyboardInterrupt`,
+  so the program appeared frozen until every in-flight worker finished
+  its current multi-GB file (potentially many minutes). The runner now
+  uses an explicit `try/finally` with `pool.shutdown(wait=False,
+  cancel_futures=True)`, plus a shared `threading.Event` `stop_event`
+  threaded through `HfStream._next_chunk` and
+  `ChunkedBlobUpload._patch_with_retry`. Workers in flight short-circuit
+  at the next chunk boundary (sub-second at typical bandwidth) by
+  raising `InterruptedError`, while the main thread re-raises so the
+  CLI exits 130 promptly. State integrity is preserved: `mark_pushed`
+  only runs after a layer fully closes, so partial files are never
+  recorded.
+
 ## [0.3.0] - 2026-05-08
 
 ### Changed
