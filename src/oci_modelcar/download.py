@@ -173,6 +173,8 @@ class HfDownloader:
                     self._sleep_backoff(attempt)
                     continue
                 raise
+            except InterruptedError:
+                raise  # stop_event abort — never retry
             except _TRANSIENT_TRANSPORT_ERRORS as e:
                 log.warning(
                     "HF read failed for %s at %d/%d (attempt %d/%d): %s",

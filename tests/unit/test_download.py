@@ -143,3 +143,48 @@ def test_download_partial_file_cleaned_on_exception(httpserver: HTTPServer, tmp_
     partial = spool / "sources" / "file.bin.partial"
     final = spool / "sources" / "file.bin"
     assert not partial.exists() and not final.exists()
+
+
+def test_download_aborts_within_two_chunks_of_stop_event(
+    httpserver: HTTPServer, tmp_path: Path
+) -> None:
+    """Regression test for v0.x: 50 GB DL was uncancellable. v1 must cancel
+    within ~2 x CHUNK_DEFAULT (~2 MiB) of stop_event.set()."""
+    import threading
+
+    big_payload = b"X" * (8 * 1024 * 1024)
+    httpserver.expect_request("/repo/resolve/main/big.bin").respond_with_data(
+        big_payload, headers={"Content-Length": str(len(big_payload))}
+    )
+    spool = tmp_path / "spool"
+    stop = threading.Event()
+    api = HfApi(endpoint=httpserver.url_for(""))
+    session = build_session()
+    session.adapters.clear()
+    from requests.adapters import HTTPAdapter as _Adapter
+
+    session.mount("http://", _Adapter(max_retries=0))
+    session.mount("https://", _Adapter(max_retries=0))
+    d = HfDownloader(api=api, session=session, spool_dir=spool, stop_event=stop, max_retries=1)
+    f = HfFile(path="big.bin", size=len(big_payload), lfs_sha256=None)
+
+    chunks_seen = 0
+    raised: list[BaseException] = []
+
+    def progress(_n: int) -> None:
+        nonlocal chunks_seen
+        chunks_seen += 1
+        if chunks_seen == 1:
+            stop.set()  # request abort after the first chunk
+
+    def runner() -> None:
+        try:
+            d.download("repo", "main", f, progress_cb=progress)
+        except BaseException as e:
+            raised.append(e)
+
+    t = threading.Thread(target=runner)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "download did not abort within timeout"
+    assert raised and isinstance(raised[0], InterruptedError)
