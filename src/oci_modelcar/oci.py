@@ -246,6 +246,11 @@ class ChunkedBlobUpload:
                 backoff_idx += 1
 
     def _resync(self) -> None:
+        # Pooled connections may hold a half-dead SSL socket after a mid-stream
+        # cut — re-using it for the resync GET would fail immediately on the
+        # very thing we're trying to recover from. Drop the pool first; it
+        # repopulates lazily on the GET below.
+        self.client.session.get_adapter(self.location).close()
         r = self.client.session.get(self.location, headers=self.client.auth, timeout=30)
         if r.status_code != 204:
             r.raise_for_status()

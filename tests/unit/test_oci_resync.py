@@ -10,6 +10,47 @@ def _client(httpserver: HTTPServer) -> OciClient:
     return OciClient(host_url=httpserver.url_for(""))
 
 
+def test_resync_drops_pooled_connections_before_get(httpserver: HTTPServer):
+    """A mid-stream cut may leave a half-dead SSL socket in urllib3's pool;
+    re-using it for the resync GET would fail immediately. _resync must
+    close the adapter's pool before issuing the GET so the request goes
+    through a fresh connection."""
+    from unittest.mock import patch as _patch
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/fresh")}
+    )
+    httpserver.expect_request("/u/fresh", method="GET").respond_with_data(
+        "", status=204, headers={"Range": "0-0"}
+    )
+
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(client, repo="repo", chunk_size=64)
+
+    adapter = client.session.get_adapter(upload.location)
+    events: list[str] = []
+    real_close = adapter.close
+    real_get = client.session.get
+
+    def tracking_close() -> None:
+        events.append("adapter_close")
+        real_close()
+
+    def tracking_get(*args: object, **kwargs: object) -> object:
+        events.append("session_get")
+        return real_get(*args, **kwargs)
+
+    with (
+        _patch.object(adapter, "close", tracking_close),
+        _patch.object(client.session, "get", tracking_get),
+    ):
+        upload._resync()
+
+    assert events == ["adapter_close", "session_get"], (
+        f"adapter.close() must precede the resync GET; got {events}"
+    )
+
+
 def test_resync_no_range_header(httpserver: HTTPServer):
     httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
         "", status=202, headers={"Location": httpserver.url_for("/u/1")}
