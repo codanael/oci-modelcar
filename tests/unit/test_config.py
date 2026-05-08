@@ -68,6 +68,27 @@ def test_config_chunk_mib_zero_raises(monkeypatch):
         Config.from_env_and_args(["--chunk-mib", "0"])
 
 
+def test_config_chunk_mib_accepts_large_value(monkeypatch):
+    """Cap was raised from 1024 (1 GiB) to 65536 (64 GiB) so users can
+    upload multi-GB layers in a single PATCH on Artifactory clusters
+    without LB sticky sessions — see CHANGELOG. RAM is the natural
+    limiter, not an arbitrary cap."""
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--chunk-mib", "8192"])
+    assert cfg.chunk_mib == 8192
+    assert cfg.chunk_bytes == 8192 * 1024 * 1024
+
+
+def test_config_chunk_mib_above_new_cap_raises(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(ConfigError, match="chunk_mib"):
+        Config.from_env_and_args(["--chunk-mib", "65537"])
+
+
 def test_verbose_and_quiet_env_mutually_exclusive(monkeypatch):
     monkeypatch.setenv("HF_REPO", "foo/bar")
     monkeypatch.setenv("REGISTRY", "registry.example.com")

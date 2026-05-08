@@ -125,8 +125,17 @@ class Config:
             raise ConfigError("target_repo is required (--target-repo or TARGET_REPO)")
         if not (1 <= self.workers <= 8):
             raise ConfigError(f"workers must be in [1, 8], got {self.workers}")
-        if not (1 <= self.chunk_mib <= 1024):
-            raise ConfigError(f"chunk_mib must be in [1, 1024], got {self.chunk_mib}")
+        # Cap is generous (64 GiB) because RAM is the natural limiter, not
+        # an arbitrary policy. Large values are sometimes required: registries
+        # behind a load balancer without sticky session affinity (Artifactory
+        # cluster, Harbor + reverse proxy) reroute each PATCH to a potentially
+        # different node, breaking the upload session. Setting chunk_mib >=
+        # the largest layer size collapses the whole upload into 1-2 PATCHes,
+        # eliminating per-PATCH routing decisions — same approach as
+        # containers/image (Podman, Skopeo) and Jib, both of which stream
+        # the entire blob in one PATCH.
+        if not (1 <= self.chunk_mib <= 65536):
+            raise ConfigError(f"chunk_mib must be in [1, 65536], got {self.chunk_mib}")
         if not (0 <= self.hf_max_retries <= 100):
             raise ConfigError(f"hf_max_retries must be in [0, 100], got {self.hf_max_retries}")
         if not (0 <= self.oci_max_retries <= 100):
@@ -166,7 +175,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--also-tag", default=None, help="CSV list of additional tags")
     p.add_argument("--allow-patterns", default=None)
     p.add_argument("--layer-prefix", default=None)
-    p.add_argument("--chunk-mib", default=None, type=int)
+    p.add_argument(
+        "--chunk-mib",
+        default=None,
+        type=int,
+        help=(
+            "OCI upload PATCH chunk size in MiB (default 32, max 65536). "
+            "On registries behind a load balancer without sticky session "
+            "affinity (Artifactory cluster, Harbor + reverse proxy), set "
+            "this to >= the largest layer size to upload each blob in a "
+            "single PATCH and avoid per-PATCH routing decisions. "
+            "Per-worker peak RAM is ~2x this value."
+        ),
+    )
     p.add_argument("--workers", default=None, type=int)
     p.add_argument("--state-file", default=None)
     p.add_argument("--hf-max-retries", default=None, type=int)

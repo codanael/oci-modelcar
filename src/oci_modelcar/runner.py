@@ -303,6 +303,14 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     plog.info(f"HF repo     : {cfg.hf_repo}")
     plog.info(f"Revision in : {cfg.hf_revision}")
     plog.info(f"Revision    : {revision_resolved}")
+    if cfg.chunk_mib >= 1024:
+        # Per-worker RAM is roughly 2x chunk_size during a flush; called out
+        # so users intentionally raising chunk_mib (typically to bypass
+        # cluster routing issues — see CHANGELOG) understand the tradeoff.
+        plog.info(
+            f"OCI upload chunk size: {cfg.chunk_mib} MiB "
+            f"(~{2 * cfg.chunk_mib} MiB peak RAM per worker)"
+        )
 
     target_tag = derive_tag(revision_resolved, explicit=cfg.target_tag)
     image_ref = f"{oci_client.host}/{cfg.target_repo}:{target_tag}"

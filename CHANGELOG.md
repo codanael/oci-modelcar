@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`--chunk-mib` cap raised from 1024 (1 GiB) to 65536 (64 GiB).** Default
+  remains 32 MiB. Large values are now permitted to mitigate Artifactory
+  HA cluster + load balancer setups that lack sticky session affinity:
+  each PATCH on the upload session can be routed to a different node,
+  causing 500s like `failed to stream binary to sub provider` and
+  `Binary info is only available after successful read of the entire
+  stream`, plus a stream of 200/204 non-spec responses and SSL EOFs as
+  partial state confuses the cluster. Setting `--chunk-mib >= largest
+  layer size` collapses the upload into a single PATCH per blob — same
+  shape as `containers/image` (Podman, Skopeo) and Jib, both of which
+  stream the full blob in one PATCH (`docker_image_dest.go:PutBlobWithOptions`,
+  `BlobPusher.java`). One PATCH = one TCP request = one LB routing
+  decision, eliminating the per-PATCH split. Per-worker peak RAM is
+  ~2x `chunk_mib`; the runner logs the chosen size when it exceeds 1 GiB.
+
 ### Fixed
 - **PATCH chunk commit accepts `200`/`201`/`202`/`204` (was `202` only).**
   OCI Distribution v1.1 mandates `202 Accepted` on chunk commit, but real
