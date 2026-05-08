@@ -188,3 +188,36 @@ def test_download_aborts_within_two_chunks_of_stop_event(
     t.join(timeout=5)
     assert not t.is_alive(), "download did not abort within timeout"
     assert raised and isinstance(raised[0], InterruptedError)
+
+
+def test_download_handles_range_200_fallback(
+    httpserver: HTTPServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If first attempt downloads partial bytes then fails, and the second
+    attempt sends Range but server ignores it (returns 200), the partial
+    file is truncated and download restarts cleanly."""
+    payload = b"Y" * 4096
+    state: dict[str, bool] = {"served": False}
+
+    def handler(request):  # type: ignore[no-untyped-def]
+        from werkzeug.wrappers import Response
+
+        if not state["served"]:
+            state["served"] = True
+            # First call: short body (1024 bytes) that closes after Content-Length
+            return Response(
+                payload[:1024],
+                status=200,
+                headers={"Content-Length": str(len(payload[:1024]))},
+            )
+        # Subsequent calls: ignore Range, return full payload with 200
+        return Response(payload, status=200, headers={"Content-Length": str(len(payload))})
+
+    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_handler(handler)
+    spool = tmp_path / "spool"
+    d = _make_downloader(httpserver, spool)
+    f = HfFile(path="file.bin", size=len(payload), lfs_sha256=None)
+
+    monkeypatch.setattr("oci_modelcar.download.time.sleep", lambda _d: None)
+    out = d.download("repo", "main", f)
+    assert out.read_bytes() == payload
