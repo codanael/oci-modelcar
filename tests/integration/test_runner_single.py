@@ -31,7 +31,7 @@ def test_process_one_file_pushes_layer(httpserver: HTTPServer):
     oci_client = OciClient(host_url=httpserver.url_for(""))
     hf_file = HfFile(path="file.txt", size=len(payload))
 
-    descriptor, diff_id = process_one_file(
+    descriptor, diff_id, telemetry = process_one_file(
         hf_client=hf_client,
         oci_client=oci_client,
         repo="repo",
@@ -44,6 +44,9 @@ def test_process_one_file_pushes_layer(httpserver: HTTPServer):
     assert descriptor.digest.startswith("sha256:")
     assert descriptor.size > len(payload)  # tar overhead
     assert diff_id == descriptor.digest
+    # Telemetry is populated even on tiny payloads
+    assert telemetry.bytes_through > 0
+    assert telemetry.elapsed_s >= 0
 
     # Verify the bytes pushed match what we'd expect from a tar containing payload
     assert received["data"]

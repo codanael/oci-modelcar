@@ -65,7 +65,7 @@ use plain HTTP. Pass an explicit `http://` or `https://` prefix on
 | `--target-tag` | `<sha[:12]>` | Image tag |
 | `--also-tag` | — | CSV of alias tags |
 | `--workers` | `1` | Parallel layers (cap 8) |
-| `--chunk-mib` | `8` | PATCH chunk size |
+| `--chunk-mib` | `32` | PATCH chunk size (MiB). Larger amortizes per-PATCH overhead — bumped from 8 in v0.5.0 after empirically validating a substantial speedup on real registries. Memory footprint is `~2 × chunk_mib × workers` MiB peak. |
 | `--state-file` | `~/.local/state/oci-modelcar/state.json` | JSON resume state |
 | `--fail-fast` / `--continue-on-error` | fail-fast | Failure policy |
 | `--log-style` | auto | `text` or `azure` |

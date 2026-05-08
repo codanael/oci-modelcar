@@ -15,7 +15,7 @@ def test_config_from_env_minimal(monkeypatch):
     assert cfg.target_repo == "models/x"
     assert cfg.target_tag is None  # derived later
     assert cfg.workers == 1
-    assert cfg.chunk_mib == 8
+    assert cfg.chunk_mib == 32
 
 
 def test_config_cli_overrides_env(monkeypatch):

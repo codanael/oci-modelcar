@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Pipelined HF download / OCI push.** `process_one_file` now runs the HF
+  read + tar wrapping on a producer thread and the OCI PATCH stream on
+  the main (consumer) thread, bridged by a bounded `_PipeBuffer`. The two
+  stages no longer backpressure each other one-for-one — when
+  HF ≈ OCI in throughput, the pipelined version effectively doubles
+  total wall-clock throughput vs. the serial coupling. Memory cost:
+  `pipe_max_chunks × pipe_coalesce_size` ≈ 8 MiB extra per worker.
+- **Per-file throughput + bottleneck telemetry.** Each pushed file emits
+  one INFO line at completion: `path: 1.23 GB in 12.3s (100 MB/s); HF
+  wait 0.8s (6%), OCI wait 8.5s (69%)`. The two wait values come from
+  the `_PipeBuffer` (time the producer spent blocked on `put` because
+  the consumer was slow ⇒ OCI bottleneck; symmetric for `get` ⇒ HF
+  bottleneck). Cached files emit no telemetry (no real transfer
+  happened). Surfaced as a new `FileTelemetry` field returned from
+  `process_one_file` alongside `(descriptor, diff_id)`.
+
+### Changed
+- **Default `--chunk-mib` raised from 8 to 32.** Empirical validation on
+  real registries showed that the per-PATCH overhead (TCP RTT + HTTP
+  headers + TLS) dominates on fast LAN links, and amortizing it over
+  larger chunks gives a substantial speedup. Memory baseline: ~64 MiB
+  pic per worker (vs. 16 MiB before); with the default 1 worker that's
+  immaterial, with `--workers 8` it's ~512 MiB peak. Override with
+  `--chunk-mib N` to go back down (1–1024 MiB allowed).
+
 ## [0.4.1] - 2026-05-08
 
 ### Fixed
