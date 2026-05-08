@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import logging
 import random
 import time
@@ -10,10 +11,18 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 import requests
+import urllib3.exceptions
 
 from oci_modelcar.http import build_session, huggingface_auth_header
 
 log = logging.getLogger(__name__)
+
+_TRANSIENT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    requests.RequestException,
+    urllib3.exceptions.ProtocolError,
+    http.client.IncompleteRead,
+    OSError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +131,14 @@ class HfStream:
         headers = dict(self.client.auth)
         if start > 0:
             headers["Range"] = f"bytes={start}-"
+            pct = 100.0 * start / self.expected_size if self.expected_size > 0 else 0.0
+            log.info(
+                "resuming %s at offset %d/%d (%.1f%%)",
+                self.path,
+                start,
+                self.expected_size,
+                pct,
+            )
         r = self.client.session.get(url, headers=headers, stream=True, timeout=600)
         r.raise_for_status()
         if start == 0:
@@ -164,15 +181,24 @@ class HfStream:
                 self.bytes_buffered += len(chunk)
                 return chunk
             except StopIteration:
-                return None
-            except (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ReadTimeout,
-            ) as e:
+                if self.bytes_buffered >= self.expected_size:
+                    return None
                 log.warning(
-                    "HF read failed at offset %d (attempt %d/%d): %s",
+                    "HF stream ended early for %s at %d/%d (attempt %d/%d)",
+                    self.path,
                     self.bytes_buffered,
+                    self.expected_size,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                self._close_response()
+                self._sleep_backoff(attempt)
+            except _TRANSIENT_TRANSPORT_ERRORS as e:
+                log.warning(
+                    "HF read failed for %s at offset %d/%d (attempt %d/%d): %s",
+                    self.path,
+                    self.bytes_buffered,
+                    self.expected_size,
                     attempt + 1,
                     self.max_retries,
                     e,
@@ -190,31 +216,10 @@ class HfStream:
                 if c is None:
                     break
                 chunks.append(c)
-            data = b"".join(chunks)
-            if self.bytes_buffered < self.expected_size:
-                # Try to resume
-                self._close_response()
-                self._open(start=self.bytes_buffered)
-                while self.bytes_buffered < self.expected_size:
-                    c = self._next_chunk()
-                    if c is None:
-                        break
-                    data += c
-                if self.bytes_buffered < self.expected_size:
-                    raise RuntimeError(
-                        f"truncated read for {self.path}: "
-                        f"got {self.bytes_buffered} expected {self.expected_size}"
-                    )
-            return data
-        # Bounded read(n)
+            return b"".join(chunks)
         while len(self.buf) < n:
             c = self._next_chunk()
             if c is None:
-                # Truncation? Try resume
-                if self.bytes_buffered < self.expected_size:
-                    self._close_response()
-                    self._open(start=self.bytes_buffered)
-                    continue
                 break
             self.buf += c
         out, self.buf = self.buf[:n], self.buf[n:]

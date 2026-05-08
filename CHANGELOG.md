@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- HuggingFace download retries now absorb the full set of transport-layer
+  failure modes (`urllib3.exceptions.ProtocolError`, `http.client.IncompleteRead`,
+  raw `OSError`, plus the existing `requests` exception family). Premature
+  end-of-stream (the response generator finishing before `Content-Length` is
+  reached) is also handled uniformly: the stream is reopened with
+  `Range: bytes=N-` and the read continues, mirroring `wget --continue` /
+  `curl --continue-at` semantics. This prevents repeated upstream cuts on
+  large files (multi-GB) from aborting a push when the underlying connection
+  is severed at a fixed offset.
+- `HfStream.read(-1)` is no longer single-shot on resume: it shares the same
+  unbounded resume loop as `read(n)`, so cascaded cuts during a full-file
+  read are recovered instead of raising a truncation error.
+
+### Added
+- INFO-level log line on every Range-based resume, showing
+  `path`, current offset, expected total, and percentage. Makes multi-resume
+  pushes observable without enabling verbose mode.
+
 ## [0.2.0] - 2026-05-07
 
 ### Added

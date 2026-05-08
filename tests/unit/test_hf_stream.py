@@ -1,4 +1,11 @@
+import http.client
+import logging
+from typing import Any
+from unittest.mock import patch
+
 import pytest
+import requests
+import urllib3.exceptions
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
@@ -7,6 +14,35 @@ from oci_modelcar.hf import HfClient, HfStream
 
 def _make_client(httpserver: HTTPServer) -> HfClient:
     return HfClient(endpoint=httpserver.url_for(""), repo="foo/bar")
+
+
+def _make_short_handler(payload: bytes, start: int, deliver: int, total: int) -> Any:
+    """Build a handler that delivers `deliver` bytes starting at `start`,
+    while claiming the full remaining length in Content-Length."""
+
+    def handler(req: Any) -> Response:
+        if start > 0:
+            assert req.headers.get("Range") == f"bytes={start}-"
+
+        def gen() -> Any:
+            yield payload[start : start + deliver]
+
+        if start == 0:
+            return Response(
+                gen(),
+                status=200,
+                headers={"Content-Length": str(total)},
+            )
+        return Response(
+            gen(),
+            status=206,
+            headers={
+                "Content-Length": str(total - start),
+                "Content-Range": f"bytes {start}-{total - 1}/{total}",
+            },
+        )
+
+    return handler
 
 
 def test_hfstream_reads_full_file(httpserver: HTTPServer):
@@ -91,6 +127,137 @@ def test_hfstream_range_resume(httpserver: HTTPServer):
     out = stream.read(-1)
     assert out == payload
     assert call_count["n"] == 1
+
+
+def test_hfstream_resumes_through_multiple_cuts_read_full(httpserver: HTTPServer):
+    """A flaky upstream that truncates repeatedly is fully recovered via Range
+    even when read(-1) is used: the resume loop must be unbounded, not single-shot."""
+    payload = b"X" * 200
+    for offset in (0, 50, 100):
+        httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+            _make_short_handler(payload, start=offset, deliver=50, total=200)
+        )
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+        _make_short_handler(payload, start=150, deliver=50, total=200)
+    )
+
+    client = _make_client(httpserver)
+    stream = HfStream(
+        client,
+        revision="main",
+        path="file.bin",
+        size=len(payload),
+        max_retries=2,
+        backoff_initial=0.0,
+        chunk_size=10,
+    )
+    out = stream.read(-1)
+    assert out == payload
+
+
+def test_hfstream_resumes_through_multiple_cuts_read_bounded(httpserver: HTTPServer):
+    """Same scenario but consumed via small read(n) calls: must drain fully."""
+    payload = b"Y" * 200
+    for offset in (0, 50, 100):
+        httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+            _make_short_handler(payload, start=offset, deliver=50, total=200)
+        )
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+        _make_short_handler(payload, start=150, deliver=50, total=200)
+    )
+
+    client = _make_client(httpserver)
+    stream = HfStream(
+        client,
+        revision="main",
+        path="file.bin",
+        size=len(payload),
+        max_retries=2,
+        backoff_initial=0.0,
+        chunk_size=10,
+    )
+    out = b""
+    while len(out) < len(payload):
+        chunk = stream.read(37)
+        if not chunk:
+            break
+        out += chunk
+    assert out == payload
+
+
+def test_hfstream_logs_progress_on_resume(httpserver: HTTPServer, caplog: pytest.LogCaptureFixture):
+    """Each resume after a cut should emit an INFO log carrying the new offset
+    and the expected total, so multi-resume runs are observable."""
+    payload = b"Z" * 100
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+        _make_short_handler(payload, start=0, deliver=40, total=100)
+    )
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+        _make_short_handler(payload, start=40, deliver=60, total=100)
+    )
+    client = _make_client(httpserver)
+    stream = HfStream(
+        client,
+        revision="main",
+        path="file.bin",
+        size=len(payload),
+        max_retries=2,
+        backoff_initial=0.0,
+        chunk_size=10,
+    )
+    with caplog.at_level(logging.INFO, logger="oci_modelcar.hf"):
+        out = stream.read(-1)
+    assert out == payload
+    resume_logs = [r for r in caplog.records if "resum" in r.getMessage().lower()]
+    assert resume_logs, "expected at least one resume log line"
+    msg = resume_logs[0].getMessage()
+    assert "40" in msg and "100" in msg
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        urllib3.exceptions.ProtocolError("Connection broken"),
+        http.client.IncompleteRead(b""),
+        OSError("connection reset by peer"),
+    ],
+    ids=["ProtocolError", "IncompleteRead", "OSError"],
+)
+def test_hfstream_retries_on_transport_exceptions(httpserver: HTTPServer, exc: Exception):
+    """Transport-layer exceptions raised by iter_content (regardless of which
+    specific class urllib3/requests surfaces) must trigger a Range-based resume."""
+    payload = b"A" * 100
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+        _make_short_handler(payload, start=30, deliver=70, total=100)
+    )
+
+    real_iter_content = requests.Response.iter_content
+    call_count = {"n": 0}
+
+    def flaky_iter_content(self: requests.Response, chunk_size: int = 1) -> Any:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            yield payload[:30]
+            raise exc
+        yield from real_iter_content(self, chunk_size=chunk_size)
+
+    client = _make_client(httpserver)
+    with patch.object(requests.Response, "iter_content", flaky_iter_content):
+        stream = HfStream(
+            client,
+            revision="main",
+            path="file.bin",
+            size=len(payload),
+            max_retries=3,
+            backoff_initial=0.0,
+            chunk_size=10,
+        )
+        out = stream.read(-1)
+    assert out == payload
+    assert call_count["n"] >= 2
 
 
 def test_hfstream_size_mismatch_on_resume_validates_content_range(httpserver: HTTPServer):
