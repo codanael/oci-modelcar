@@ -47,3 +47,34 @@ def test_process_one_file_pushes_layer(httpserver: HTTPServer):
 
     # Verify the bytes pushed match what we'd expect from a tar containing payload
     assert received["data"]
+
+
+def test_process_one_file_forwards_progress_cb(httpserver: HTTPServer):
+    """progress_cb passed to process_one_file is invoked during HF read."""
+    payload = b"X" * 4096
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/2")}
+    )
+    httpserver.expect_request("/u/2", method="PUT").respond_with_data("", status=201)
+
+    hf_client = HfClient(endpoint=httpserver.url_for(""), repo="foo/bar")
+    oci_client = OciClient(host_url=httpserver.url_for(""))
+    hf_file = HfFile(path="file.bin", size=len(payload))
+
+    seen: list[int] = []
+    process_one_file(
+        hf_client=hf_client,
+        oci_client=oci_client,
+        repo="repo",
+        revision="main",
+        hf_file=hf_file,
+        layer_prefix="models/",
+        chunk_size=8 * 1024 * 1024,
+        progress_cb=seen.append,
+    )
+    # At least one progress call observed; final cumulative equals total
+    assert seen, "progress_cb was never invoked"
+    assert seen[-1] == len(payload)
