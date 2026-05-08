@@ -31,11 +31,19 @@ _HTTP_DEBUG_ENABLED = False
 def _truncate_http_debug_arg(arg: object, max_len: int = 1500) -> object:
     """Clip the body out of an http.client debug ``send:`` repr.
 
-    ``http.client.HTTPConnection.send`` prints ``"send:", repr(data)`` when
-    debuglevel > 0. For PATCH/PUT, ``data`` carries the full chunk body
-    (multi-MB safetensors slice) and dumping it drowns the diagnostic
-    signal. We keep everything up to the HTTP header/body separator
-    (``\\r\\n\\r\\n``) and replace the body with a length marker.
+    ``http.client.HTTPConnection.send`` is called twice per request: once
+    with the header bytes (``b"PATCH /url HTTP/1.1\\r\\n...\\r\\n\\r\\n"``)
+    and once with the body bytes (``b"<binary>"``). With debuglevel > 0,
+    each call does ``print("send:", repr(data))`` — and PATCH/PUT bodies
+    can be 32 MiB of safetensors, drowning the diagnostic signal.
+
+    Two truncation modes:
+
+    1. Header repr (contains ``\\r\\n\\r\\n``): keep up to and including
+       the separator, replace the trailing body part with a length marker.
+    2. Pure body repr (no separator): collapse to ``b'<body N bytes>'`` —
+       zero bytes of content shown, since binary noise is useless for
+       diagnosis anyway.
 
     Non-string args and short strings pass through unchanged.
     """
@@ -46,7 +54,11 @@ def _truncate_http_debug_arg(arg: object, max_len: int = 1500) -> object:
     if 0 < idx < max_len:
         body_chars = len(arg) - idx - len(sep) - 1
         return arg[: idx + len(sep)] + f"<body {body_chars} bytes>'"
-    return arg[:max_len] + f"<{len(arg) - max_len} more chars>"
+    # Pure body: collapse entirely. Preserve the b'/b" prefix and trailing
+    # quote so the line still parses as a Python repr to a human reader.
+    if (arg.startswith("b'") and arg.endswith("'")) or (arg.startswith('b"') and arg.endswith('"')):
+        return f"{arg[:2]}<body {len(arg) - 3} bytes>{arg[-1]}"
+    return f"<{len(arg)} chars truncated>"
 
 
 def _maybe_enable_http_debug() -> None:

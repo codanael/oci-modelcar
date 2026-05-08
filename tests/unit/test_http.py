@@ -166,15 +166,40 @@ def test_truncate_http_debug_arg_passthrough_short_strings():
     assert _truncate_http_debug_arg(s) == s
 
 
-def test_truncate_http_debug_arg_clips_at_max_when_no_separator():
-    """If no \\r\\n\\r\\n marker is found, fall back to a fixed-length cut."""
+def test_truncate_http_debug_arg_collapses_pure_body_repr():
+    """Body-only repr (the second send() call inside http.client) has no
+    \\r\\n\\r\\n separator. We collapse it to b'<body N bytes>' instead of
+    showing 1500 chars of binary noise."""
+    from oci_modelcar.http import _truncate_http_debug_arg
+
+    s = "b'" + ("\\xff" * 20000) + "'"
+    out = _truncate_http_debug_arg(s)
+    assert isinstance(out, str)
+    assert len(out) < 50, f"pure body must collapse fully, got {len(out)} chars"
+    assert out.startswith("b'<body ")
+    assert out.endswith(" bytes>'")
+    assert "\\xff" not in out
+
+
+def test_truncate_http_debug_arg_collapses_double_quoted_body():
+    """Some Python reprs use b\"...\" instead of b'...' — handle both."""
+    from oci_modelcar.http import _truncate_http_debug_arg
+
+    s = 'b"' + ("\\xff" * 20000) + '"'
+    out = _truncate_http_debug_arg(s)
+    assert out.startswith('b"<body ')
+    assert out.endswith(' bytes>"')
+
+
+def test_truncate_http_debug_arg_long_string_no_quotes_falls_back():
+    """A long non-repr string still gets a generic length marker."""
     from oci_modelcar.http import _truncate_http_debug_arg
 
     s = "x" * 5000
     out = _truncate_http_debug_arg(s, max_len=1000)
     assert isinstance(out, str)
-    assert len(out) < 1100
-    assert "more chars" in out
+    assert len(out) < 100
+    assert "5000 chars truncated" in out
 
 
 def test_truncate_http_debug_arg_passthrough_non_string():
@@ -182,6 +207,53 @@ def test_truncate_http_debug_arg_passthrough_non_string():
 
     assert _truncate_http_debug_arg(b"raw bytes") == b"raw bytes"
     assert _truncate_http_debug_arg(42) == 42
+
+
+def test_debug_http_does_not_dump_body_on_real_patch(monkeypatch, capsys):
+    """End-to-end: with OCI_MODELCAR_DEBUG_HTTP=1, an actual PATCH with a
+    100 KB body must not flood stdout with the body content. This catches
+    regressions where the print wrapper isn't actually wired into
+    http.client (e.g., setattr was no-op, or LOAD_GLOBAL skipped the
+    module dict)."""
+    import http.client
+
+    from pytest_httpserver import HTTPServer
+    from werkzeug.wrappers import Response
+
+    import oci_modelcar.http as _http_mod
+
+    monkeypatch.setenv("OCI_MODELCAR_DEBUG_HTTP", "1")
+    monkeypatch.setattr(_http_mod, "_HTTP_DEBUG_ENABLED", False, raising=False)
+    original_debuglevel = http.client.HTTPConnection.debuglevel
+    original_print = getattr(http.client, "print", None)
+    server = HTTPServer()
+    server.start()
+    try:
+        server.expect_request("/probe", method="PATCH").respond_with_response(
+            Response("", status=204)
+        )
+        s = build_session()
+        big_body = b"\xab\xcd" * 50_000  # 100 KB; high-bit so repr expands ~4x
+        s.patch(server.url_for("/probe"), data=big_body)
+        captured = capsys.readouterr()
+        # Diagnostic info MUST still be visible.
+        out = captured.out + captured.err
+        assert "send:" in out, "wire-level send: line is missing — wrapper broken"
+        # Body MUST be collapsed.
+        assert "\\xab\\xcd\\xab\\xcd\\xab\\xcd" not in out, (
+            "body content was dumped to stdout — truncation didn't fire on the "
+            "second send() call (pure-body repr)"
+        )
+        # The body marker must appear somewhere.
+        assert "<body" in out, f"expected <body N bytes> marker; got:\n{out[:500]}"
+    finally:
+        server.stop()
+        http.client.HTTPConnection.debuglevel = original_debuglevel
+        if original_print is None:
+            if hasattr(http.client, "print"):
+                delattr(http.client, "print")
+        else:
+            http.client.print = original_print  # type: ignore[attr-defined]
 
 
 def test_build_session_debug_http_installs_truncating_print(monkeypatch):
