@@ -2,7 +2,9 @@ import hashlib
 import io
 import tarfile
 
-from oci_modelcar.tar_layer import build_layer_tar_bytes
+import pytest
+
+from oci_modelcar.tar_layer import build_layer_tar_bytes, tar_layer_size
 
 
 def test_layer_tar_is_reproducible():
@@ -39,3 +41,16 @@ def test_layer_tar_diff_id_equals_sha_of_bytes():
     diff_id = "sha256:" + hashlib.sha256(raw).hexdigest()
     assert diff_id.startswith("sha256:")
     assert len(diff_id.split(":")[1]) == 64
+
+
+@pytest.mark.parametrize("file_size", [0, 1, 100, 511, 512, 513, 1024, 1025, 12345, 1048576])
+def test_tar_layer_size_matches_actual_bytes(file_size: int):
+    """Streaming uploads need to set Content-Length upfront, so the formula
+    must equal the bytes that build_layer_tar_bytes / stream_layer_to
+    actually produce. This is sensitive to Python's tarfile blocking factor
+    (RECORDSIZE = 10240) — if a future tarfile change alters padding, this
+    test catches it before a streaming PATCH gets a wrong Content-Length
+    and the registry hangs waiting for missing bytes."""
+    actual = len(build_layer_tar_bytes("models/", "weights.bin", b"x" * file_size))
+    formula = tar_layer_size(file_size)
+    assert actual == formula, f"file_size={file_size}: actual={actual} formula={formula}"

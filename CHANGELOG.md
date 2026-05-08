@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Streaming upload mode (now the default).** New
+  `StreamingBlobUpload` issues a single PATCH per blob with the body
+  sourced from a byte iterator and `Content-Length` set upfront — same
+  wire shape as `containers/image` (Podman, Skopeo, `docker_image_dest.go:
+  PutBlobWithOptions`) and Jib (`BlobPusher.java`). Eliminates per-PATCH
+  load-balancer routing decisions on registries that lack sticky session
+  affinity (Artifactory HA cluster, Harbor + reverse proxy): one PATCH =
+  one TCP request = one routing decision, so the entire blob lands on
+  one node.
+  - `--upload-mode streaming` (env `OCI_MODELCAR_UPLOAD_MODE=streaming`)
+    is now the default. The previous chunked behavior remains available
+    via `--upload-mode chunked`, which keeps intra-blob retry on transient
+    cuts and is preferable on extremely flaky links where mid-blob
+    resumption matters more than cluster compatibility.
+  - Tradeoff: streaming mode has no intra-blob retry. A mid-PATCH cut
+    surfaces immediately and the runner handles file-level retry across
+    runs via `state.json`.
+  - Per-worker memory in streaming mode is bounded by the producer/
+    consumer pipe (~8 MiB) regardless of `--chunk-mib`. Chunked mode
+    remains O(2 × chunk_mib) per worker.
+  - New helper `tar_layer.tar_layer_size(file_size)` computes the exact
+    tar-layer byte count deterministically (header + body + trailer
+    padded to RECORDSIZE = 10240) so streaming PATCH can declare
+    `Content-Length` upfront.
+
 ### Changed
 - **`--chunk-mib` cap raised from 1024 (1 GiB) to 65536 (64 GiB).** Default
   remains 32 MiB. Large values are now permitted to mitigate Artifactory

@@ -18,14 +18,15 @@ def test_process_one_file_pushes_layer(httpserver: HTTPServer):
         "", status=202, headers={"Location": httpserver.url_for("/u/1")}
     )
 
-    # OCI PUT close (small payload, all in PUT)
+    # Streaming mode (default) issues one PATCH with the full layer body, then PUT.
     received = {"data": b""}
 
-    def put_handler(request):
+    def patch_handler(request):
         received["data"] = request.data
-        return Response("", status=201)
+        return Response("", status=202, headers={"Location": httpserver.url_for("/u/1")})
 
-    httpserver.expect_request("/u/1", method="PUT").respond_with_handler(put_handler)
+    httpserver.expect_request("/u/1", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/u/1", method="PUT").respond_with_data("", status=201)
 
     hf_client = HfClient(endpoint=httpserver.url_for(""), repo="foo/bar")
     oci_client = OciClient(host_url=httpserver.url_for(""))
@@ -59,6 +60,9 @@ def test_process_one_file_forwards_progress_cb(httpserver: HTTPServer):
         payload, headers={"Content-Length": str(len(payload))}
     )
     httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/2")}
+    )
+    httpserver.expect_request("/u/2", method="PATCH").respond_with_data(
         "", status=202, headers={"Location": httpserver.url_for("/u/2")}
     )
     httpserver.expect_request("/u/2", method="PUT").respond_with_data("", status=201)

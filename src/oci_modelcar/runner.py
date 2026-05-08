@@ -22,6 +22,7 @@ from oci_modelcar.oci import (
     BlobDescriptor,
     ChunkedBlobUpload,
     OciClient,
+    StreamingBlobUpload,
     head_blob,
     push_manifest,
     push_small_blob,
@@ -29,7 +30,7 @@ from oci_modelcar.oci import (
 )
 from oci_modelcar.state import JobState, JsonStateStore
 from oci_modelcar.tags import derive_tag
-from oci_modelcar.tar_layer import stream_layer_to
+from oci_modelcar.tar_layer import stream_layer_to, tar_layer_size
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +199,7 @@ def process_one_file(
     stop_event: threading.Event | None = None,
     pipe_max_chunks: int = 8,
     pipe_coalesce_size: int = 1024 * 1024,
+    upload_mode: str = "streaming",
 ) -> tuple[BlobDescriptor, str, FileTelemetry]:
     """Stream one HF file as one tar layer; returns (descriptor, diff_id, telemetry).
 
@@ -205,6 +207,11 @@ def process_one_file(
     by a bounded `_PipeBuffer`, decoupling the two stages so they no longer
     backpressure each other one-for-one. Telemetry on producer/consumer wait
     times pinpoints which side is the bottleneck.
+
+    `upload_mode='streaming'` issues one PATCH per blob (matches Podman/Jib);
+    `upload_mode='chunked'` falls back to N PATCHes of `chunk_size` bytes
+    each with intra-blob retry. See StreamingBlobUpload docstring for the
+    tradeoff.
 
     For uncompressed tar layers, diff_id == descriptor.digest.
     """
@@ -221,14 +228,6 @@ def process_one_file(
     pipe = _PipeBuffer(
         max_chunks=pipe_max_chunks,
         coalesce_size=pipe_coalesce_size,
-        stop_event=stop_event,
-    )
-    upload = ChunkedBlobUpload(
-        client=oci_client,
-        repo=repo,
-        chunk_size=chunk_size,
-        max_retries=oci_max_retries,
-        backoff_initial=backoff_initial,
         stop_event=stop_event,
     )
 
@@ -257,14 +256,42 @@ def process_one_file(
     started = time.monotonic()
     producer.start()
 
+    digest: str
+    layer_size: int
+
     try:
         try:
-            while True:
-                chunk = pipe.get_chunk()
-                if chunk is None:
-                    break
-                upload.write(chunk)
-            digest, layer_size = upload.close()
+            if upload_mode == "streaming":
+
+                def pipe_iter() -> Any:
+                    while True:
+                        chunk = pipe.get_chunk()
+                        if chunk is None:
+                            break
+                        yield chunk
+
+                streaming = StreamingBlobUpload(
+                    client=oci_client,
+                    repo=repo,
+                    total_size=tar_layer_size(hf_file.size),
+                    stop_event=stop_event,
+                )
+                digest, layer_size = streaming.upload(pipe_iter())
+            else:
+                upload = ChunkedBlobUpload(
+                    client=oci_client,
+                    repo=repo,
+                    chunk_size=chunk_size,
+                    max_retries=oci_max_retries,
+                    backoff_initial=backoff_initial,
+                    stop_event=stop_event,
+                )
+                while True:
+                    chunk = pipe.get_chunk()
+                    if chunk is None:
+                        break
+                    upload.write(chunk)
+                digest, layer_size = upload.close()
         except BaseException:
             # Unblock any stuck producer put() so producer can exit promptly.
             pipe.drain_and_abort()
@@ -303,10 +330,11 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     plog.info(f"HF repo     : {cfg.hf_repo}")
     plog.info(f"Revision in : {cfg.hf_revision}")
     plog.info(f"Revision    : {revision_resolved}")
-    if cfg.chunk_mib >= 1024:
-        # Per-worker RAM is roughly 2x chunk_size during a flush; called out
-        # so users intentionally raising chunk_mib (typically to bypass
-        # cluster routing issues — see CHANGELOG) understand the tradeoff.
+    plog.info(f"OCI upload mode: {cfg.upload_mode}")
+    if cfg.upload_mode == "chunked" and cfg.chunk_mib >= 1024:
+        # In chunked mode, per-worker RAM is roughly 2x chunk_size during a
+        # flush. Streaming mode is bounded by the network buffer regardless
+        # of chunk_mib, so the warning only applies here.
         plog.info(
             f"OCI upload chunk size: {cfg.chunk_mib} MiB "
             f"(~{2 * cfg.chunk_mib} MiB peak RAM per worker)"
@@ -419,6 +447,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             oci_max_retries=cfg.oci_max_retries,
             progress_cb=emitter.update,
             stop_event=stop_event,
+            upload_mode=cfg.upload_mode,
         )
         state.mark_pushed(
             job_key,

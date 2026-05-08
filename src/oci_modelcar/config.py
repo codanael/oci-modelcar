@@ -57,6 +57,7 @@ class Config:
     oci_max_retries: int = 10
     fail_fast: bool = True
     force: bool = False
+    upload_mode: str = "streaming"
     log_style: str | None = None  # None = auto-detect
     verbose: bool = False
     quiet: bool = False
@@ -107,6 +108,11 @@ class Config:
                 False if ns.continue_on_error else (ns.fail_fast or _envbool("FAIL_FAST", True))
             ),
             force=ns.force or _envbool("FORCE", False),
+            upload_mode=(
+                ns.upload_mode
+                if ns.upload_mode is not None
+                else _envstr("OCI_MODELCAR_UPLOAD_MODE", "streaming")
+            ),
             log_style=ns.log_style or os.environ.get("LOG_STYLE"),
             verbose=ns.verbose or _envbool("LOG_VERBOSE", False),
             quiet=ns.quiet or _envbool("LOG_QUIET", False),
@@ -151,6 +157,10 @@ class Config:
                 raise ConfigError(f"also_tag {t!r} is invalid")
         if self.log_style is not None and self.log_style not in ("text", "azure"):
             raise ConfigError(f"log_style must be 'text' or 'azure', got {self.log_style!r}")
+        if self.upload_mode not in ("streaming", "chunked"):
+            raise ConfigError(
+                f"upload_mode must be 'streaming' or 'chunked', got {self.upload_mode!r}"
+            )
 
     @property
     def chunk_bytes(self) -> int:
@@ -196,6 +206,21 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--fail-fast", action="store_true", default=False)
     g.add_argument("--continue-on-error", action="store_true", default=False)
     p.add_argument("--force", action="store_true", default=False)
+    p.add_argument(
+        "--upload-mode",
+        default=None,
+        choices=["streaming", "chunked"],
+        help=(
+            "OCI blob upload protocol shape (default: streaming). 'streaming' "
+            "issues a single PATCH per blob with body=iterator and Content-"
+            "Length set upfront — matches containers/image (Podman, Skopeo) "
+            "and Jib, and works with registries behind a load balancer "
+            "without sticky session affinity. 'chunked' issues multiple "
+            "PATCHes (--chunk-mib bytes each) with intra-blob retry on "
+            "transient cuts; better for very flaky links but breaks on "
+            "Artifactory clusters that reroute PATCHes between nodes."
+        ),
+    )
     p.add_argument("--log-style", default=None, choices=["text", "azure"])
     g2 = p.add_mutually_exclusive_group()
     g2.add_argument("--verbose", action="store_true", default=False)

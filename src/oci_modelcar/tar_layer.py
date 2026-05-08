@@ -11,6 +11,24 @@ import io
 import tarfile
 from typing import IO
 
+_TAR_BLOCKSIZE = 512  # one tar record (header or data block)
+_TAR_RECORDSIZE = 10240  # Python tarfile blocking factor: pads to 20 records
+
+
+def tar_layer_size(file_size: int) -> int:
+    """Exact byte size of a single-file uncompressed tar archive.
+
+    Layout: 512-byte header + file body padded to 512 + 1024-byte trailer
+    (two zero blocks), all padded up to RECORDSIZE = 10240. Deterministic
+    given mtime=0/uid=0/gid=0 (the headers we always emit). Streaming
+    uploads use this to set Content-Length upfront — Content-Length must
+    match the bytes actually emitted by ``stream_layer_to`` or the registry
+    will hang waiting for missing bytes (or reject as bad framing).
+    """
+    body_padded = (file_size + _TAR_BLOCKSIZE - 1) // _TAR_BLOCKSIZE * _TAR_BLOCKSIZE
+    raw = _TAR_BLOCKSIZE + body_padded + 2 * _TAR_BLOCKSIZE  # header + body + trailer (2 blocks)
+    return (raw + _TAR_RECORDSIZE - 1) // _TAR_RECORDSIZE * _TAR_RECORDSIZE
+
 
 def make_tar_info(prefix: str, filename: str, size: int) -> tarfile.TarInfo:
     info = tarfile.TarInfo(name=prefix + filename)

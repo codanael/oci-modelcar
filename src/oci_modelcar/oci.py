@@ -7,6 +7,7 @@ import logging
 import random
 import threading
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -307,6 +308,131 @@ class ChunkedBlobUpload:
             r.raise_for_status()
             raise RuntimeError(f"unexpected status {r.status_code} on PUT close")
         return digest, self.total
+
+
+class _IteratorReader:
+    """File-like adapter that fronts a byte-iterator for ``requests.patch``.
+
+    ``requests`` switches to chunked Transfer-Encoding when ``data`` is an
+    iterable, but registries (and middleware) sometimes mishandle chunked
+    PATCH. Wrapping the iterator as a file-like object with a known
+    ``Content-Length`` header keeps the wire shape identical to a fixed-
+    size PATCH — which is what containers/image and Jib do.
+
+    Hashes bytes on the fly so the digest is ready by the time the body
+    is fully consumed (no second pass over the data).
+    """
+
+    def __init__(self, source: Iterator[bytes], hasher: hashlib._Hash) -> None:
+        self._iter = source
+        self._buf = b""
+        self._h = hasher
+        self.bytes_yielded = 0
+
+    def read(self, size: int = -1) -> bytes:
+        while size < 0 or len(self._buf) < size:
+            try:
+                chunk = next(self._iter)
+            except StopIteration:
+                break
+            if not chunk:
+                continue
+            self._h.update(chunk)
+            self._buf += chunk
+        if size < 0:
+            out, self._buf = self._buf, b""
+        else:
+            out, self._buf = self._buf[:size], self._buf[size:]
+        self.bytes_yielded += len(out)
+        return out
+
+
+class StreamingBlobUpload:
+    """Single-PATCH streaming blob upload.
+
+    Issues one ``PATCH <Location>`` per blob with the body sourced from a
+    byte iterator (typically the consumer side of ``runner._PipeBuffer``)
+    and ``Content-Length`` set upfront from the known total size. Matches
+    the wire shape of containers/image (Podman, Skopeo) and Jib, both of
+    which stream the entire blob in one PATCH.
+
+    Use over ``ChunkedBlobUpload`` when the registry sits behind a load
+    balancer without sticky session affinity (Artifactory HA cluster,
+    Harbor + reverse proxy): one PATCH = one TCP request = one routing
+    decision, eliminating the per-PATCH split where Node A starts the
+    upload and Node B receives a later chunk.
+
+    Tradeoff: no intra-blob retry. A mid-PATCH cut surfaces immediately
+    and the runner handles file-level retry across runs via state.json.
+    For flaky links where mid-blob retries matter, ``ChunkedBlobUpload``
+    remains available.
+    """
+
+    def __init__(
+        self,
+        client: OciClient,
+        repo: str,
+        total_size: int,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self.client = client
+        self.repo = repo
+        self.total_size = total_size
+        self.stop_event = stop_event
+        self.location = self._begin()
+
+    def _begin(self) -> str:
+        url = self.client.url(self.repo, "blobs", "uploads") + "/"
+        r = self.client.session.post(url, headers=self.client.auth, timeout=60)
+        if r.status_code != 202:
+            r.raise_for_status()
+            raise RuntimeError(f"unexpected status {r.status_code} on upload init")
+        loc = r.headers.get("Location")
+        if not loc:
+            raise RuntimeError("upload init missing Location header")
+        return loc
+
+    def upload(self, source: Iterable[bytes]) -> tuple[str, int]:
+        """Stream the blob via one PATCH then PUT-close. Returns (digest, size).
+
+        ``source`` is consumed exactly once. On any error during the PATCH
+        (SSL EOF, ConnectionError, non-success status, etc.) the exception
+        propagates — no in-blob retry. The producer thread on the other end
+        of the pipe should be aborted by the caller's exception handler.
+        """
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError(f"OCI upload to {self.repo} aborted by stop_event before start")
+        h = hashlib.sha256()
+        body = _IteratorReader(iter(source), h)
+        # Read timeout is generous (10 min) because a single PATCH can carry
+        # multi-GB; connect timeout stays tight.
+        hdr = {
+            **self.client.auth,
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(self.total_size),
+            "Content-Range": f"0-{self.total_size - 1}",
+        }
+        r = self.client.session.patch(self.location, data=body, headers=hdr, timeout=(30, 600))
+        if r.status_code in (200, 201, 202, 204):
+            self.location = r.headers.get("Location", self.location)
+        else:
+            r.raise_for_status()
+            raise RuntimeError(
+                f"unexpected PATCH status {r.status_code} for streaming upload to {self.repo}"
+            )
+        if body.bytes_yielded != self.total_size:
+            raise RuntimeError(
+                f"streaming upload byte count mismatch: yielded {body.bytes_yielded}, "
+                f"declared {self.total_size}"
+            )
+        digest = "sha256:" + h.hexdigest()
+        sep = "&" if "?" in self.location else "?"
+        url = f"{self.location}{sep}digest={digest}"
+        rp = self.client.session.put(url, headers=self.client.auth, timeout=120)
+        if rp.status_code != 201:
+            rp.raise_for_status()
+            raise RuntimeError(f"unexpected status {rp.status_code} on PUT close")
+        return digest, self.total_size
 
 
 def push_small_blob(client: OciClient, repo: str, data: bytes) -> str:
