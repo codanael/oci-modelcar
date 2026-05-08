@@ -70,15 +70,16 @@ import requests
 def enable_http_debug() -> None:
     """urllib3 + http.client wire-level debug logging on stderr.
 
-    Equivalent of OCI_MODELCAR_DEBUG_HTTP=1 in the package; here we set it
-    directly (and as env var, in case downstream code re-reads it).
+    Delegates to ``oci_modelcar.http._maybe_enable_http_debug`` so the
+    body-truncating print wrapper (which keeps PATCH/PUT bodies out of
+    the output) is installed identically to a production run with
+    ``OCI_MODELCAR_DEBUG_HTTP=1``.
     """
-    import http.client
-
-    http.client.HTTPConnection.debuglevel = 1
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s %(message)s")
-    logging.getLogger("urllib3").setLevel(logging.DEBUG)
     os.environ["OCI_MODELCAR_DEBUG_HTTP"] = "1"
+    from oci_modelcar.http import _maybe_enable_http_debug  # type: ignore[import-untyped]
+
+    _maybe_enable_http_debug()
 
 
 @dataclass

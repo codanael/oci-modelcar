@@ -28,6 +28,27 @@ _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
 _HTTP_DEBUG_ENABLED = False
 
 
+def _truncate_http_debug_arg(arg: object, max_len: int = 1500) -> object:
+    """Clip the body out of an http.client debug ``send:`` repr.
+
+    ``http.client.HTTPConnection.send`` prints ``"send:", repr(data)`` when
+    debuglevel > 0. For PATCH/PUT, ``data`` carries the full chunk body
+    (multi-MB safetensors slice) and dumping it drowns the diagnostic
+    signal. We keep everything up to the HTTP header/body separator
+    (``\\r\\n\\r\\n``) and replace the body with a length marker.
+
+    Non-string args and short strings pass through unchanged.
+    """
+    if not isinstance(arg, str) or len(arg) <= max_len:
+        return arg
+    sep = "\\r\\n\\r\\n"
+    idx = arg.find(sep)
+    if 0 < idx < max_len:
+        body_chars = len(arg) - idx - len(sep) - 1
+        return arg[: idx + len(sep)] + f"<body {body_chars} bytes>'"
+    return arg[:max_len] + f"<{len(arg) - max_len} more chars>"
+
+
 def _maybe_enable_http_debug() -> None:
     """Wire-level HTTP debug logging, opt-in via ``OCI_MODELCAR_DEBUG_HTTP=1``.
 
@@ -35,7 +56,8 @@ def _maybe_enable_http_debug() -> None:
     line, request headers, response status, response headers to stdout) and
     raises the ``urllib3`` logger to DEBUG (connection-level events like
     "Starting new HTTPS connection", "Resetting dropped connection",
-    retry telemetry).
+    retry telemetry). Replaces ``http.client``'s ``print`` with a
+    body-truncating wrapper so PATCH/PUT bodies don't drown the output.
 
     Diagnostic substitute for tcpdump when you can't easily capture packets
     or decrypt TLS in an airgapped environment.
@@ -53,8 +75,16 @@ def _maybe_enable_http_debug() -> None:
         "on",
     ):
         return
+    import builtins
     import http.client
 
+    real_print = builtins.print
+
+    def truncating_print(*args: object, **kwargs: Any) -> None:
+        clipped = tuple(_truncate_http_debug_arg(a) for a in args)
+        real_print(*clipped, **kwargs)
+
+    http.client.print = truncating_print  # type: ignore[attr-defined]
     http.client.HTTPConnection.debuglevel = 1
     logging.getLogger("urllib3").setLevel(logging.DEBUG)
     _HTTP_DEBUG_ENABLED = True

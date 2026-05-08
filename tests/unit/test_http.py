@@ -141,6 +141,93 @@ def test_build_session_debug_http_disabled_by_default(monkeypatch):
         http.client.HTTPConnection.debuglevel = original
 
 
+def test_truncate_http_debug_arg_clips_body_after_separator():
+    """A long PATCH wire repr must keep headers and replace the body with
+    a size marker, not dump every byte."""
+    from oci_modelcar.http import _truncate_http_debug_arg
+
+    headers = "b'PATCH /upload HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: 100000\\r\\n\\r\\n"
+    body = "A" * 100_000
+    s = headers + body + "'"
+    out = _truncate_http_debug_arg(s)
+    assert isinstance(out, str)
+    assert "PATCH /upload" in out
+    assert "Content-Length: 100000" in out
+    assert "<body" in out and "bytes>" in out
+    assert "AAAAAA" not in out
+    assert len(out) < 500
+
+
+def test_truncate_http_debug_arg_passthrough_short_strings():
+    """Short reprs (typical GET / HEAD) must be untouched."""
+    from oci_modelcar.http import _truncate_http_debug_arg
+
+    s = "send: b'GET / HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n'"
+    assert _truncate_http_debug_arg(s) == s
+
+
+def test_truncate_http_debug_arg_clips_at_max_when_no_separator():
+    """If no \\r\\n\\r\\n marker is found, fall back to a fixed-length cut."""
+    from oci_modelcar.http import _truncate_http_debug_arg
+
+    s = "x" * 5000
+    out = _truncate_http_debug_arg(s, max_len=1000)
+    assert isinstance(out, str)
+    assert len(out) < 1100
+    assert "more chars" in out
+
+
+def test_truncate_http_debug_arg_passthrough_non_string():
+    from oci_modelcar.http import _truncate_http_debug_arg
+
+    assert _truncate_http_debug_arg(b"raw bytes") == b"raw bytes"
+    assert _truncate_http_debug_arg(42) == 42
+
+
+def test_build_session_debug_http_installs_truncating_print(monkeypatch):
+    """When OCI_MODELCAR_DEBUG_HTTP=1, http.client.print is replaced with
+    a body-truncating wrapper."""
+    import builtins
+    import http.client
+
+    import oci_modelcar.http as _http_mod
+
+    monkeypatch.setenv("OCI_MODELCAR_DEBUG_HTTP", "1")
+    monkeypatch.setattr(_http_mod, "_HTTP_DEBUG_ENABLED", False, raising=False)
+    original_debuglevel = http.client.HTTPConnection.debuglevel
+    original_print = getattr(http.client, "print", None)
+    try:
+        build_session()
+        wrapped = getattr(http.client, "print", None)
+        assert wrapped is not None and wrapped is not builtins.print, (
+            "http.client.print must be replaced with a wrapper"
+        )
+        # Round-trip: the wrapper must clip a long body.
+        captured: list[str] = []
+
+        def fake_real_print(*args, **kwargs):
+            captured.append(" ".join(str(a) for a in args))
+
+        monkeypatch.setattr(builtins, "print", fake_real_print)
+        # Re-install with our fake real_print as the underlying writer:
+        # easiest way is to call build_session() again with state reset.
+        monkeypatch.setattr(_http_mod, "_HTTP_DEBUG_ENABLED", False, raising=False)
+        build_session()
+        new_wrapper = http.client.print  # type: ignore[attr-defined]
+        long_body = "b'PATCH /x HTTP/1.1\\r\\nContent-Length: 9000\\r\\n\\r\\n" + "Z" * 9000 + "'"
+        new_wrapper(long_body)
+        assert captured, "wrapper must call through to the underlying print"
+        assert "<body" in captured[-1]
+        assert "ZZZZZ" not in captured[-1]
+    finally:
+        http.client.HTTPConnection.debuglevel = original_debuglevel
+        if original_print is None:
+            if hasattr(http.client, "print"):
+                delattr(http.client, "print")
+        else:
+            http.client.print = original_print  # type: ignore[attr-defined]
+
+
 def test_docker_config_auth_handles_missing(tmp_path):
     assert docker_config_auth(tmp_path / "missing.json", "x") is None
 
