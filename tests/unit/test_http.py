@@ -1,7 +1,12 @@
 import base64
 import json
+import ssl
+
+import pytest
+import urllib3.exceptions
 
 from oci_modelcar.http import (
+    _SmartRetry,
     build_session,
     docker_config_auth,
     huggingface_token,
@@ -66,3 +71,41 @@ def test_build_session_has_user_agent():
 
 def test_docker_config_auth_handles_missing(tmp_path):
     assert docker_config_auth(tmp_path / "missing.json", "x") is None
+
+
+def test_smart_retry_raises_immediately_on_ssl_error():
+    """SSL errors must NOT be retried — they never recover from a CA misconfig.
+    increment() must surface the original exception so urllib3 stops retrying."""
+    retry = _SmartRetry(total=8, backoff_factor=2)
+    err = ssl.SSLError("CERTIFICATE_VERIFY_FAILED")
+    with pytest.raises(ssl.SSLError):
+        retry.increment(method="GET", url="https://example/", error=err)
+
+
+def test_smart_retry_raises_immediately_on_urllib3_ssl_error():
+    retry = _SmartRetry(total=8, backoff_factor=2)
+    err = urllib3.exceptions.SSLError("handshake failure")
+    with pytest.raises(urllib3.exceptions.SSLError):
+        retry.increment(method="GET", url="https://example/", error=err)
+
+
+def test_smart_retry_raises_immediately_on_proxy_error():
+    retry = _SmartRetry(total=8, backoff_factor=2)
+    err = urllib3.exceptions.ProxyError("bad proxy", OSError("nope"))
+    with pytest.raises(urllib3.exceptions.ProxyError):
+        retry.increment(method="GET", url="https://example/", error=err)
+
+
+def test_smart_retry_passes_through_other_errors():
+    """Non-fatal transport errors still consume retries normally."""
+    retry = _SmartRetry(total=8, backoff_factor=2)
+    err = urllib3.exceptions.ProtocolError("connection reset")
+    new_retry = retry.increment(method="GET", url="https://example/", error=err)
+    assert isinstance(new_retry, _SmartRetry)
+
+
+def test_build_session_uses_smart_retry():
+    """The session adapter must carry the SSL-aware retry policy."""
+    s = build_session()
+    adapter = s.get_adapter("https://example/")
+    assert isinstance(adapter.max_retries, _SmartRetry)

@@ -5,13 +5,45 @@ from __future__ import annotations
 import base64
 import json
 import os
+import ssl
 from pathlib import Path
+from typing import Any
 
 import requests
+import urllib3.exceptions
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from oci_modelcar import __version__
+
+_NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
+    ssl.SSLError,
+    urllib3.exceptions.SSLError,
+    urllib3.exceptions.ProxyError,
+)
+
+
+class _SmartRetry(Retry):
+    """Retry policy that surfaces non-recoverable errors immediately.
+
+    SSL handshake failures and proxy misconfig don't get better with retry —
+    silently looping on them just hides the real issue from the user. Any
+    error in `_NEVER_RETRY_EXC` re-raises out of `increment()` so urllib3
+    stops dead instead of burning the full backoff schedule.
+    """
+
+    def increment(  # type: ignore[override]
+        self,
+        method: str | None = None,
+        url: str | None = None,
+        response: Any = None,
+        error: Exception | None = None,
+        _pool: Any = None,
+        _stacktrace: Any = None,
+    ) -> Retry:
+        if error is not None and isinstance(error, _NEVER_RETRY_EXC):
+            raise error
+        return super().increment(method, url, response, error, _pool, _stacktrace)
 
 
 def build_session() -> requests.Session:
@@ -21,7 +53,7 @@ def build_session() -> requests.Session:
     those have their own resync-aware retry logic in oci.py.
     """
     s = requests.Session()
-    retry = Retry(
+    retry = _SmartRetry(
         total=8,
         backoff_factor=2,
         status_forcelist=[408, 429, 500, 502, 503, 504],

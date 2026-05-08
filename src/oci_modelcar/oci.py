@@ -169,6 +169,9 @@ class ChunkedBlobUpload:
                         return
                     continue
                 r.raise_for_status()
+            except (requests.exceptions.SSLError, requests.exceptions.ProxyError):
+                # Cert / proxy misconfig never recovers. Surface immediately.
+                raise
             except (
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,

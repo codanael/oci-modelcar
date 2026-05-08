@@ -128,6 +128,71 @@ def test_hfstream_aborts_when_stop_event_is_set(httpserver: HTTPServer):
         stream.read(-1)
 
 
+def test_hfstream_does_not_retry_on_ssl_error(httpserver: HTTPServer):
+    """SSLError mid-stream surfaces immediately, no retry attempts.
+
+    A misconfigured CA never recovers — silent retries just hide the cause.
+    """
+    payload = b"X" * 100
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+
+    iter_calls = {"n": 0}
+
+    def ssl_iter_content(self: requests.Response, chunk_size: int = 1) -> Any:
+        iter_calls["n"] += 1
+        raise requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
+        yield  # pragma: no cover  (make this a generator)
+
+    client = _make_client(httpserver)
+    with patch.object(requests.Response, "iter_content", ssl_iter_content):
+        stream = HfStream(
+            client,
+            revision="main",
+            path="file.bin",
+            size=len(payload),
+            max_retries=10,
+            backoff_initial=0.0,
+            chunk_size=10,
+        )
+        with pytest.raises(requests.exceptions.SSLError):
+            stream.read(-1)
+    # iter_content was wired during __init__; the read raised SSL on first next().
+    # Without the fix, _next_chunk would silently retry up to 10 times, calling
+    # _open()→iter_content() each time. With the fix, exactly one iter_content call.
+    assert iter_calls["n"] == 1, f"expected 1 iter_content call, got {iter_calls['n']}"
+
+
+def test_hfstream_does_not_retry_on_proxy_error(httpserver: HTTPServer):
+    payload = b"Y" * 100
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+
+    iter_calls = {"n": 0}
+
+    def proxy_iter_content(self: requests.Response, chunk_size: int = 1) -> Any:
+        iter_calls["n"] += 1
+        raise requests.exceptions.ProxyError("bad proxy")
+        yield  # pragma: no cover
+
+    client = _make_client(httpserver)
+    with patch.object(requests.Response, "iter_content", proxy_iter_content):
+        stream = HfStream(
+            client,
+            revision="main",
+            path="file.bin",
+            size=len(payload),
+            max_retries=10,
+            backoff_initial=0.0,
+            chunk_size=10,
+        )
+        with pytest.raises(requests.exceptions.ProxyError):
+            stream.read(-1)
+    assert iter_calls["n"] == 1
+
+
 def test_hfstream_size_mismatch_raises(httpserver: HTTPServer):
     httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
         b"X" * 100, headers={"Content-Length": "100"}
