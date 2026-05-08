@@ -134,3 +134,52 @@ def test_config_continue_on_error_overrides_fail_fast(monkeypatch):
     monkeypatch.setenv("TARGET_REPO", "models/x")
     cfg = Config.from_env_and_args(["--continue-on-error"])
     assert cfg.fail_fast is False
+
+
+def test_config_also_tags_csv(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--also-tag", "v1.0,latest,prod"])
+    assert cfg.also_tags == ["v1.0", "latest", "prod"]
+
+
+def test_config_also_tags_invalid_raises(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(ConfigError, match="also_tag"):
+        Config.from_env_and_args(["--also-tag", "bad/tag"])
+
+
+def test_config_log_style_invalid_raises(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--log-style", "bogus"])
+
+
+def test_config_chunk_mib_flag_rejected(monkeypatch):
+    """v0.x removed flag — argparse should error."""
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--chunk-mib", "32"])
+
+
+def test_config_state_file_flag_rejected(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--state-file", "/tmp/x.json"])
+
+
+def test_config_upload_mode_flag_rejected(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--upload-mode", "chunked"])
