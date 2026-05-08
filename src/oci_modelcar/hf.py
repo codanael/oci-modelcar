@@ -25,6 +25,11 @@ _TRANSIENT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     OSError,
 )
 
+_FATAL_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    requests.exceptions.SSLError,
+    requests.exceptions.ProxyError,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class HfFile:
@@ -202,6 +207,12 @@ class HfStream:
                 )
                 self._close_response()
                 self._sleep_backoff(attempt)
+            except _FATAL_TRANSPORT_ERRORS:
+                # SSL / proxy errors never recover from retry. Surface immediately
+                # so the user sees the real cause (e.g. self-signed CA) instead of
+                # a silent backoff loop.
+                self._close_response()
+                raise
             except _TRANSIENT_TRANSPORT_ERRORS as e:
                 log.warning(
                     "HF read failed for %s at offset %d/%d (attempt %d/%d): %s",

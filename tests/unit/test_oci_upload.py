@@ -1,6 +1,9 @@
 import hashlib
 import re
+from unittest.mock import patch
 
+import pytest
+import requests
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
@@ -88,6 +91,70 @@ def test_content_range_format_no_prefix(httpserver: HTTPServer):
     upload = ChunkedBlobUpload(client, repo="repo", chunk_size=64)
     upload.write(payload)
     upload.close()
+
+
+def test_chunked_upload_does_not_retry_on_ssl_error(httpserver: HTTPServer):
+    """SSLError on PATCH must surface immediately, no retry."""
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/ssl")}
+    )
+    # Without an early-raise on SSL, the OCI retry path falls into _resync (GET).
+    # Register a GET handler so the no-fix case fails fast on the count assertion
+    # rather than hanging on urllib3 status-code retries against an unmatched route.
+    httpserver.expect_request("/upload/ssl", method="GET").respond_with_data(
+        "", status=204, headers={"Range": "0-0"}
+    )
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client,
+        repo="repo",
+        chunk_size=64,
+        max_retries=10,
+        backoff_initial=0.0,
+    )
+
+    calls = {"n": 0}
+
+    def ssl_patch(self: requests.Session, *args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        raise requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
+
+    with (
+        patch.object(requests.Session, "patch", ssl_patch),
+        pytest.raises(requests.exceptions.SSLError),
+    ):
+        upload.write(b"Z" * 128)  # forces flush of one 64-byte chunk
+    assert calls["n"] == 1, f"expected 1 PATCH attempt, got {calls['n']}"
+
+
+def test_chunked_upload_does_not_retry_on_proxy_error(httpserver: HTTPServer):
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/px")}
+    )
+    httpserver.expect_request("/upload/px", method="GET").respond_with_data(
+        "", status=204, headers={"Range": "0-0"}
+    )
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client,
+        repo="repo",
+        chunk_size=64,
+        max_retries=10,
+        backoff_initial=0.0,
+    )
+
+    calls = {"n": 0}
+
+    def proxy_patch(self: requests.Session, *args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        raise requests.exceptions.ProxyError("bad proxy")
+
+    with (
+        patch.object(requests.Session, "patch", proxy_patch),
+        pytest.raises(requests.exceptions.ProxyError),
+    ):
+        upload.write(b"Z" * 128)
+    assert calls["n"] == 1
 
 
 def test_patch_content_range_is_inclusive(httpserver: HTTPServer):
