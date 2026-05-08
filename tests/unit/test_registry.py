@@ -2,9 +2,10 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from unittest.mock import patch as mock_patch
 
 import pytest
-import requests as _requests  # noqa: F401  # used in Task 5.4 retry tests
+import requests as _requests
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
@@ -260,3 +261,137 @@ def test_streaming_no_chunked_transfer_encoding(httpserver, tmp_path):
 
     te = seen_te[0] or ""
     assert "chunked" not in te.lower(), f"Transfer-Encoding leaked chunked: {te!r}"
+
+
+def test_streaming_retries_on_ssl_eof_with_file_rewound(httpserver, tmp_path, monkeypatch):
+    """First PATCH attempt raises mid-stream SSL EOF; second succeeds.
+    File must be reopened/rewound; full body sent again from offset 0."""
+    payload = b"R" * 1024
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    f = tmp_path / "layer.tar"
+    f.write_bytes(payload)
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/eof")}
+    )
+    received = bytearray()
+
+    def patch_handler(request):
+        received.extend(request.data)
+        return Response("", status=202, headers={"Location": httpserver.url_for("/u/eof")})
+
+    httpserver.expect_request("/u/eof", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/u/eof", method="PUT").respond_with_data("", status=201)
+
+    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
+
+    real_patch = _requests.Session.patch
+    calls = {"n": 0}
+
+    def flaky_patch(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _requests.exceptions.SSLError(
+                "EOF occurred in violation of protocol (_ssl.c:2437)"
+            )
+        return real_patch(self, *args, **kwargs)
+
+    upload = StreamingBlobUpload(
+        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+    )
+    with mock_patch.object(_requests.Session, "patch", flaky_patch):
+        out_digest, _out_size = upload.push_from_file(f, len(payload), digest)
+
+    assert out_digest == digest
+    assert calls["n"] == 2, "must retry exactly once after SSL EOF"
+    assert bytes(received) == payload, "second attempt must re-send full body"
+
+
+def test_streaming_does_not_retry_on_handshake_ssl(httpserver, tmp_path):
+    """SSL handshake errors are fatal; no retry."""
+    payload = b"H" * 64
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    f = tmp_path / "layer.tar"
+    f.write_bytes(payload)
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/handshake")}
+    )
+
+    calls = {"n": 0}
+
+    def fatal_ssl_patch(self, *args, **kwargs):
+        calls["n"] += 1
+        raise _requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
+
+    upload = StreamingBlobUpload(
+        client=_client(httpserver), repo="repo", max_retries=5, backoff_initial=0.0
+    )
+    with (
+        mock_patch.object(_requests.Session, "patch", fatal_ssl_patch),
+        pytest.raises(_requests.exceptions.SSLError),
+    ):
+        upload.push_from_file(f, len(payload), digest)
+
+    assert calls["n"] == 1, "fatal SSL must not retry"
+
+
+def test_streaming_max_retries_exhausted_raises_push_error(httpserver, tmp_path, monkeypatch):
+    """All attempts fail with transient SSL EOF → PushError."""
+    payload = b"X" * 32
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    f = tmp_path / "layer.tar"
+    f.write_bytes(payload)
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/exhaust")}
+    )
+    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
+
+    calls = {"n": 0}
+
+    def always_eof(self, *args, **kwargs):
+        calls["n"] += 1
+        raise _requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2437)")
+
+    upload = StreamingBlobUpload(
+        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+    )
+    with mock_patch.object(_requests.Session, "patch", always_eof):
+        from oci_modelcar.errors import PushError
+
+        with pytest.raises(PushError, match="retries exhausted"):
+            upload.push_from_file(f, len(payload), digest)
+
+    assert calls["n"] == 3, "must call PATCH max_retries times before giving up"
+
+
+def test_streaming_retries_on_5xx(httpserver, tmp_path, monkeypatch):
+    """Server returns 503 then 202 → retry succeeds."""
+    payload = b"S" * 16
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    f = tmp_path / "layer.tar"
+    f.write_bytes(payload)
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/u/5xx")}
+    )
+
+    calls = {"n": 0}
+
+    def patch_handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Response("server unavailable", status=503)
+        return Response("", status=202, headers={"Location": httpserver.url_for("/u/5xx")})
+
+    httpserver.expect_request("/u/5xx", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/u/5xx", method="PUT").respond_with_data("", status=201)
+
+    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
+    upload = StreamingBlobUpload(
+        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+    )
+    out_digest, _ = upload.push_from_file(f, len(payload), digest)
+    assert out_digest == digest
+    assert calls["n"] == 2
