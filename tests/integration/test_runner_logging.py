@@ -12,6 +12,7 @@ from oci_modelcar.config import Config
 from oci_modelcar.hf import HfClient, HfFile
 from oci_modelcar.logging import PipelineLogger
 from oci_modelcar.oci import ML_TAR, BlobDescriptor
+from oci_modelcar.runner import FileTelemetry
 
 _SHA = "a" * 40
 
@@ -28,7 +29,14 @@ def _patch_pipeline(monkeypatch: pytest.MonkeyPatch, files: list[HfFile]) -> Non
             progress_cb(hf_file.size // 2)
             progress_cb(hf_file.size)
         digest = f"sha256:{'b' * 60}{ord(hf_file.path[0]):04x}"
-        return BlobDescriptor(media_type=ML_TAR, digest=digest, size=hf_file.size + 1024), digest
+        descriptor = BlobDescriptor(media_type=ML_TAR, digest=digest, size=hf_file.size + 1024)
+        telemetry = FileTelemetry(
+            bytes_through=hf_file.size,
+            producer_wait_s=0.0,
+            consumer_wait_s=0.0,
+            elapsed_s=0.1,
+        )
+        return descriptor, digest, telemetry
 
     monkeypatch.setattr(runner, "process_one_file", fake_process_one_file)
     monkeypatch.setattr(runner, "push_small_blob", lambda *a, **kw: "sha256:" + "c" * 64)
@@ -118,7 +126,14 @@ def test_keyboard_interrupt_sets_stop_event_and_propagates(
     def fake_process_one_file(*args, **kwargs):  # type: ignore[no-untyped-def]
         seen_stop_events.append(kwargs.get("stop_event"))
         digest = "sha256:" + "0" * 64
-        return BlobDescriptor(media_type=ML_TAR, digest=digest, size=100), digest
+        descriptor = BlobDescriptor(media_type=ML_TAR, digest=digest, size=100)
+        telemetry = FileTelemetry(
+            bytes_through=100,
+            producer_wait_s=0.0,
+            consumer_wait_s=0.0,
+            elapsed_s=0.01,
+        )
+        return descriptor, digest, telemetry
 
     monkeypatch.setattr(runner, "process_one_file", fake_process_one_file)
     monkeypatch.setattr(runner, "push_small_blob", lambda *a, **kw: "sha256:" + "c" * 64)

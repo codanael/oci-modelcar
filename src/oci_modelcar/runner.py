@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Any
 
 from oci_modelcar.config import Config
 from oci_modelcar.hf import HfClient, HfFile, HfStream
@@ -31,6 +34,155 @@ from oci_modelcar.tar_layer import stream_layer_to
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class FileTelemetry:
+    """Per-file pipeline measurements emitted at INFO after each transfer.
+
+    `producer_wait_s` is the time the HF→OCI bridge spent blocked on
+    queue.put() because the queue was full — i.e. the OCI consumer couldn't
+    keep up. `consumer_wait_s` is the symmetric: queue empty, HF couldn't
+    feed fast enough. Comparing the two against `elapsed_s` indicates which
+    side is the bottleneck (or whether the pipeline is balanced).
+    """
+
+    bytes_through: int
+    producer_wait_s: float
+    consumer_wait_s: float
+    elapsed_s: float
+
+    @property
+    def throughput_mb_s(self) -> float:
+        if self.elapsed_s <= 0:
+            return 0.0
+        return self.bytes_through / 1e6 / self.elapsed_s
+
+    def format_line(self, path: str) -> str:
+        size_str = (
+            f"{self.bytes_through / 1e9:.2f} GB"
+            if self.bytes_through >= 1_000_000_000
+            else f"{self.bytes_through / 1e6:.0f} MB"
+        )
+        if self.elapsed_s < 0.5:
+            # Too short to compute meaningful percentages
+            return f"{path}: {size_str} in {self.elapsed_s:.2f}s"
+        cons_pct = 100 * self.consumer_wait_s / self.elapsed_s
+        prod_pct = 100 * self.producer_wait_s / self.elapsed_s
+        return (
+            f"{path}: {size_str} in {self.elapsed_s:.1f}s "
+            f"({self.throughput_mb_s:.0f} MB/s); "
+            f"HF wait {self.consumer_wait_s:.1f}s ({cons_pct:.0f}%), "
+            f"OCI wait {self.producer_wait_s:.1f}s ({prod_pct:.0f}%)"
+        )
+
+
+class _PipeBuffer:
+    """Bounded thread-bridge between an HF-side producer (writable sink) and
+    an OCI-side consumer (chunk puller) with telemetry on both blocking sides.
+
+    Producer thread calls .write(bytes) (the sink protocol used by
+    stream_layer_to via tarfile). Small writes are accumulated up to
+    `coalesce_size` before being put on the queue, which keeps queue traffic
+    low even when tarfile writes 10 KiB at a time. The producer signals
+    end-of-stream with .close(), and out-of-band errors with
+    .report_exception(exc).
+
+    Consumer (main thread) calls .get_chunk() in a loop until None. An
+    exception sentinel from the producer is re-raised at consumer side so
+    the failure surfaces in the original calling context.
+
+    On consumer-side abort, .drain_and_abort() pops all queued items and
+    flips an internal flag so the producer's next .write() raises
+    InterruptedError, freeing it from any blocked put().
+
+    Telemetry: producer_wait_s tallies time the producer spent blocked on
+    put (queue full ⇒ consumer / OCI is slow); consumer_wait_s tallies time
+    the consumer spent blocked on get (queue empty ⇒ producer / HF is slow).
+    bytes_through accumulates bytes successfully consumed.
+    """
+
+    _EOF = object()  # sentinel; identity-checked
+
+    def __init__(
+        self,
+        max_chunks: int = 8,
+        coalesce_size: int = 1024 * 1024,
+        stop_event: threading.Event | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._q: queue.Queue[Any] = queue.Queue(maxsize=max_chunks)
+        self._coalesce = coalesce_size
+        self._buf = bytearray()
+        self._stop = stop_event
+        self._clock = clock
+        self._aborted = False
+        self.producer_wait_s = 0.0
+        self.consumer_wait_s = 0.0
+        self.bytes_through = 0
+
+    # --- producer (writable sink) ---
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data: bytes) -> int:
+        if self._aborted or (self._stop is not None and self._stop.is_set()):
+            raise InterruptedError("pipe write aborted")
+        self._buf.extend(data)
+        while len(self._buf) >= self._coalesce:
+            chunk = bytes(self._buf[: self._coalesce])
+            del self._buf[: self._coalesce]
+            self._timed_put(chunk)
+        return len(data)
+
+    def flush(self) -> None:
+        # tarfile may call this; coalescing happens on size threshold + close,
+        # not on flush.
+        pass
+
+    def close(self) -> None:
+        if self._buf:
+            chunk = bytes(self._buf)
+            self._buf.clear()
+            self._timed_put(chunk)
+        self._q.put(self._EOF)
+
+    def report_exception(self, exc: BaseException) -> None:
+        self._q.put(("exc", exc))
+
+    def _timed_put(self, chunk: bytes) -> None:
+        t0 = self._clock()
+        self._q.put(chunk)
+        self.producer_wait_s += self._clock() - t0
+
+    # --- consumer ---
+
+    def get_chunk(self) -> bytes | None:
+        t0 = self._clock()
+        item = self._q.get()
+        self.consumer_wait_s += self._clock() - t0
+        if item is self._EOF:
+            return None
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "exc":
+            raise item[1]
+        assert isinstance(item, bytes), f"unexpected pipe item type: {type(item)!r}"
+        self.bytes_through += len(item)
+        return item
+
+    def drain_and_abort(self) -> None:
+        """Pop everything without raising, and stop accepting writes.
+
+        Used by the consumer when it has decided to abort (its own exception
+        or external stop_event), to free a producer that may be blocked in
+        a queue.put() because the queue is full.
+        """
+        self._aborted = True
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                return
+
+
 def process_one_file(
     hf_client: HfClient,
     oci_client: OciClient,
@@ -44,8 +196,15 @@ def process_one_file(
     backoff_initial: float = 1.0,
     progress_cb: Callable[[int], None] | None = None,
     stop_event: threading.Event | None = None,
-) -> tuple[BlobDescriptor, str]:
-    """Stream one HF file as one tar layer; returns (descriptor, diff_id).
+    pipe_max_chunks: int = 8,
+    pipe_coalesce_size: int = 1024 * 1024,
+) -> tuple[BlobDescriptor, str, FileTelemetry]:
+    """Stream one HF file as one tar layer; returns (descriptor, diff_id, telemetry).
+
+    HF download (producer) and OCI push (consumer) run on two threads bridged
+    by a bounded `_PipeBuffer`, decoupling the two stages so they no longer
+    backpressure each other one-for-one. Telemetry on producer/consumer wait
+    times pinpoints which side is the bottleneck.
 
     For uncompressed tar layers, diff_id == descriptor.digest.
     """
@@ -59,6 +218,11 @@ def process_one_file(
         progress_cb=progress_cb,
         stop_event=stop_event,
     )
+    pipe = _PipeBuffer(
+        max_chunks=pipe_max_chunks,
+        coalesce_size=pipe_coalesce_size,
+        stop_event=stop_event,
+    )
     upload = ChunkedBlobUpload(
         client=oci_client,
         repo=repo,
@@ -67,19 +231,56 @@ def process_one_file(
         backoff_initial=backoff_initial,
         stop_event=stop_event,
     )
+
+    def _produce() -> None:
+        try:
+            try:
+                stream_layer_to(
+                    sink=pipe,  # type: ignore[arg-type]
+                    prefix=layer_prefix,
+                    filename=os.path.basename(hf_file.path),
+                    size=hf_file.size,
+                    source=hf_stream,  # type: ignore[arg-type]
+                )
+            finally:
+                hf_stream.close()
+        except BaseException as exc:
+            pipe.report_exception(exc)
+            return
+        pipe.close()
+
+    producer = threading.Thread(
+        target=_produce,
+        name=f"hfproducer:{hf_file.path}",
+        daemon=True,
+    )
+    started = time.monotonic()
+    producer.start()
+
     try:
-        stream_layer_to(
-            sink=upload,  # type: ignore[arg-type]
-            prefix=layer_prefix,
-            filename=os.path.basename(hf_file.path),
-            size=hf_file.size,
-            source=hf_stream,  # type: ignore[arg-type]
-        )
+        try:
+            while True:
+                chunk = pipe.get_chunk()
+                if chunk is None:
+                    break
+                upload.write(chunk)
+            digest, layer_size = upload.close()
+        except BaseException:
+            # Unblock any stuck producer put() so producer can exit promptly.
+            pipe.drain_and_abort()
+            raise
     finally:
-        hf_stream.close()
-    digest, layer_size = upload.close()
+        producer.join(timeout=30)
+
+    elapsed = time.monotonic() - started
+    telemetry = FileTelemetry(
+        bytes_through=pipe.bytes_through,
+        producer_wait_s=pipe.producer_wait_s,
+        consumer_wait_s=pipe.consumer_wait_s,
+        elapsed_s=elapsed,
+    )
     descriptor = BlobDescriptor(media_type=ML_TAR, digest=digest, size=layer_size)
-    return descriptor, digest
+    return descriptor, digest, telemetry
 
 
 @dataclass
@@ -170,7 +371,9 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     failed: list[str] = []
     stop_event = threading.Event()
 
-    def task_for_file(idx: int, hf_file: HfFile) -> tuple[int, BlobDescriptor, str, bool]:
+    def task_for_file(
+        idx: int, hf_file: HfFile
+    ) -> tuple[int, BlobDescriptor, str, bool, FileTelemetry | None]:
         cached = state.get_pushed(job_key, hf_file.path)
         cached_layer_size = cached.get("layer_size") if cached else None
         if (
@@ -188,6 +391,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
                 ),
                 str(cached["diff_id"]),
                 True,  # was_cached
+                None,  # no transfer happened ⇒ no telemetry
             )
         emitter = ProgressEmitter(
             emit=plog.info,
@@ -195,7 +399,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             total=hf_file.size,
             interval=5.0,
         )
-        descriptor, diff_id = process_one_file(
+        descriptor, diff_id, telemetry = process_one_file(
             hf_client=hf_client,
             oci_client=oci_client,
             repo=cfg.target_repo,
@@ -217,21 +421,28 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             layer_size=descriptor.size,
         )
         state.save()
-        return idx, descriptor, diff_id, False  # freshly pushed
+        return idx, descriptor, diff_id, False, telemetry
 
     def record_result(
-        idx: int, path: str, desc: BlobDescriptor, diff: str, was_cached: bool
+        idx: int,
+        path: str,
+        desc: BlobDescriptor,
+        diff: str,
+        was_cached: bool,
+        telemetry: FileTelemetry | None,
     ) -> None:
         layers_by_idx[idx] = desc
         diff_ids_by_idx[idx] = diff
         suffix = " (cached)" if was_cached else ""
         plog.info(f"{path}: -> {desc.digest[:23]}…{suffix}")
+        if telemetry is not None:
+            plog.info(telemetry.format_line(path))
 
     if cfg.workers == 1:
         for idx, hf_file in enumerate(files):
             try:
-                _, desc, diff, was_cached = task_for_file(idx, hf_file)
-                record_result(idx, hf_file.path, desc, diff, was_cached)
+                _, desc, diff, was_cached, telemetry = task_for_file(idx, hf_file)
+                record_result(idx, hf_file.path, desc, diff, was_cached, telemetry)
                 if was_cached:
                     skipped += 1
                 else:
@@ -243,15 +454,15 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
                     raise
     else:
         pool = ThreadPoolExecutor(max_workers=cfg.workers)
-        future_to_path: dict[Future[tuple[int, BlobDescriptor, str, bool]], str] = {
-            pool.submit(task_for_file, i, f): f.path for i, f in enumerate(files)
-        }
+        future_to_path: dict[
+            Future[tuple[int, BlobDescriptor, str, bool, FileTelemetry | None]], str
+        ] = {pool.submit(task_for_file, i, f): f.path for i, f in enumerate(files)}
         try:
             for fut in as_completed(future_to_path):
                 path = future_to_path[fut]
                 try:
-                    idx, desc, diff, was_cached = fut.result()
-                    record_result(idx, path, desc, diff, was_cached)
+                    idx, desc, diff, was_cached, telemetry = fut.result()
+                    record_result(idx, path, desc, diff, was_cached, telemetry)
                     if was_cached:
                         skipped += 1
                     else:

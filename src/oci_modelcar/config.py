@@ -48,7 +48,7 @@ class Config:
     also_tags: list[str] = field(default_factory=list)
     allow_patterns: tuple[str, ...] = field(default_factory=lambda: tuple(_DEFAULT_ALLOW.split()))
     layer_prefix: str = "models/"
-    chunk_mib: int = 8
+    chunk_mib: int = 32
     workers: int = 1
     state_file: Path = field(
         default_factory=lambda: _xdg_state_home() / "oci-modelcar" / "state.json"
@@ -84,7 +84,7 @@ class Config:
                 if ns.layer_prefix is not None
                 else _envstr("LAYER_PATH_PREFIX", "models/")
             ),
-            chunk_mib=int(ns.chunk_mib if ns.chunk_mib is not None else _envstr("CHUNK_MIB", "8")),
+            chunk_mib=int(ns.chunk_mib if ns.chunk_mib is not None else _envstr("CHUNK_MIB", "32")),
             workers=int(ns.workers if ns.workers is not None else _envstr("WORKERS", "1")),
             state_file=Path(
                 ns.state_file
