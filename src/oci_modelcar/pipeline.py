@@ -6,13 +6,16 @@ import contextlib
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from oci_modelcar.config import Config
 from oci_modelcar.download import HfDownloader, HfFile
-from oci_modelcar.errors import PushError
+from oci_modelcar.errors import ConfigError, PushError
 from oci_modelcar.layer import build_layer_to_file
-from oci_modelcar.manifest import ML_TAR, BlobDescriptor
+from oci_modelcar.logging import PipelineLogger
+from oci_modelcar.manifest import ML_MAN, ML_TAR, BlobDescriptor, derive_tag
 from oci_modelcar.registry import OciClient, StreamingBlobUpload
 
 log = logging.getLogger(__name__)
@@ -113,3 +116,86 @@ class FileWorker:
         repo = self.registry_client.target_repo
         assert repo is not None, "OciClient must have target_repo set for FileWorker"
         return repo
+
+
+# ---------------------------------------------------------------------------
+# RunResult
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    manifest_digest: str
+    image_ref: str
+    image_ref_digest: str
+    layers: tuple[BlobDescriptor, ...]
+    skipped_blobs: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Tag helper (HEAD existing manifest)
+# ---------------------------------------------------------------------------
+
+
+def get_manifest_digest_at_tag(client: OciClient, repo: str, tag: str) -> str | None:
+    """HEAD the manifest tag; return Docker-Content-Digest or None on 404."""
+    url = client.url(repo, "manifests", tag)
+    r = client.session.head(
+        url,
+        headers={**client.auth, "Accept": ML_MAN},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        r.raise_for_status()
+    digest = r.headers.get("Docker-Content-Digest")
+    return digest if digest else None
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+
+class Pipeline:
+    def __init__(
+        self,
+        cfg: Config,
+        plog: PipelineLogger,
+        downloader: HfDownloader | None = None,
+        registry_client: OciClient | None = None,
+    ) -> None:
+        self.cfg = cfg
+        self.plog = plog
+        self._downloader = downloader
+        self._registry_client = registry_client
+
+    @property
+    def downloader(self) -> HfDownloader:
+        if self._downloader is None:
+            raise RuntimeError("Pipeline requires a downloader")
+        return self._downloader
+
+    @property
+    def registry_client(self) -> OciClient:
+        if self._registry_client is None:
+            raise RuntimeError("Pipeline requires a registry_client")
+        return self._registry_client
+
+    def _preflight(self) -> tuple[str, list[HfFile], str]:
+        self.plog.section("Resolving HuggingFace revision")
+        revision = self.downloader.resolve_revision(self.cfg.hf_repo, self.cfg.hf_revision)
+        self.plog.info(f"HF repo  : {self.cfg.hf_repo}")
+        self.plog.info(f"Revision : {revision}")
+
+        files = self.downloader.list_files(self.cfg.hf_repo, revision, self.cfg.allow_patterns)
+        if not files:
+            raise ConfigError(
+                f"no files matched allow_patterns {self.cfg.allow_patterns} "
+                f"in {self.cfg.hf_repo}@{revision}"
+            )
+        self.plog.info(f"{len(files)} files matched")
+
+        target_tag = derive_tag(revision, explicit=self.cfg.target_tag)
+        return revision, files, target_tag

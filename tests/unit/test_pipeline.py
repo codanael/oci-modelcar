@@ -5,9 +5,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from oci_modelcar.config import Config
 from oci_modelcar.download import HfFile
+from oci_modelcar.logging import PipelineLogger
 from oci_modelcar.manifest import BlobDescriptor
-from oci_modelcar.pipeline import FileWorker
+from oci_modelcar.pipeline import FileWorker, Pipeline
 
 
 def _build_worker(tmp_path: Path, head_blob_returns=None, **overrides):
@@ -127,3 +129,77 @@ def test_file_worker_cleanup_runs_on_exception(tmp_path):
     with pytest.raises(RuntimeError, match="simulated push failure"):
         worker.process(repo="repo", revision="main", hf_file=f)
     assert not (tmp_path / "spool" / "layers" / "weights.bin.tar").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 8.3: Pipeline pre-flight helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_pipeline(tmp_path: Path, **cfg_overrides: object) -> tuple[Config, PipelineLogger]:
+    """Construct a Config + PipelineLogger with mocked external dependencies."""
+    base: dict[str, object] = dict(
+        hf_repo="foo/bar",
+        registry="registry.example.com",
+        target_repo="models/x",
+        target_tag=None,
+        also_tags=[],
+        allow_patterns=(".safetensors", ".json"),
+        layer_prefix="models/",
+        workers=1,
+        spool_dir=tmp_path / "spool",
+        clean_hf_after_push=False,
+        hf_max_retries=3,
+        oci_max_retries=3,
+        fail_fast=True,
+        force=False,
+        log_style="text",
+        verbose=False,
+        quiet=True,
+        dry_run=False,
+        sub_command="push",
+        hf_revision="main",
+        hf_endpoint="https://huggingface.co",
+    )
+    base.update(cfg_overrides)
+    cfg = Config(**base)  # type: ignore[arg-type]
+    plog = PipelineLogger(log_style="text", quiet=True)
+    return cfg, plog
+
+
+def test_pipeline_skips_when_tag_matches_existing_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If target tag exists with matching digest, log + exit 0 (no push)."""
+    pytest.skip("Tag conflict policy is exercised in task 8.6 manifest tests")
+
+
+def test_pipeline_resolves_revision_and_lists_files(tmp_path: Path) -> None:
+    cfg, plog = _build_pipeline(tmp_path)
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "9fb191250dd56d0ba7ec9785a025ed29c03d5998"
+    fake_downloader.list_files.return_value = [
+        HfFile("model.safetensors", 1000, None),
+        HfFile("config.json", 100, None),
+    ]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    rev, files, target_tag = pipeline._preflight()
+    assert rev == "9fb191250dd56d0ba7ec9785a025ed29c03d5998"
+    assert len(files) == 2
+    assert target_tag == "9fb191250dd5"
+
+
+def test_pipeline_preflight_no_files_raises_config(tmp_path: Path) -> None:
+    cfg, plog = _build_pipeline(tmp_path)
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    fake_downloader.list_files.return_value = []
+    fake_registry = MagicMock(target_repo="models/x")
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    from oci_modelcar.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="no files matched"):
+        pipeline._preflight()
