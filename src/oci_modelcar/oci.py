@@ -179,7 +179,12 @@ class ChunkedBlobUpload:
                 r = self.client.session.patch(
                     self.location, data=slice_chunk, headers=hdr, timeout=600
                 )
-                if r.status_code == 202:
+                # Spec says 202; Artifactory has been observed to return 200
+                # on chunk commit. Treat both as success. Without this, a 200
+                # falls through `raise_for_status()` (no-op on 2xx) and re-
+                # iterates without progress or budget decrement → infinite
+                # re-PATCH of the same range.
+                if r.status_code in (200, 202):
                     self.location = r.headers.get("Location", self.location)
                     self.server_offset = target_end + 1
                     return
@@ -207,6 +212,12 @@ class ChunkedBlobUpload:
                     backoff_idx += 1
                     continue
                 r.raise_for_status()
+                # 2xx (other than 200/202) and 3xx fall through here. Spec
+                # says they shouldn't happen, but if they do we must NOT
+                # silently spin — surface to the caller.
+                raise RuntimeError(
+                    f"unexpected PATCH status {r.status_code} at [{slice_start}-{target_end}]"
+                )
             except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as e:
                 # Cert / proxy misconfig never recovers. But an SSL EOF after
                 # bytes already flowed is a mid-stream connection cut — treat

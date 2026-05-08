@@ -223,6 +223,81 @@ def test_retry_budget_resets_when_server_makes_progress(httpserver: HTTPServer):
     )
 
 
+def test_patch_200_treated_as_success_artifactory_quirk(httpserver: HTTPServer):
+    """OCI Distribution v1.1 says PATCH must return 202; Artifactory has been
+    observed to return 200 on chunk commit. Both must be treated as success.
+    Otherwise the retry loop falls through without advancing server_offset
+    or decrementing attempts_left, causing infinite re-PATCH of the same
+    range (or, when the server re-checks, a 416 storm)."""
+    payload = b"A" * 200
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/jfrog")}
+    )
+
+    received = bytearray()
+    patch_count = {"n": 0}
+
+    def patch_handler(request: Any) -> Response:
+        patch_count["n"] += 1
+        cr = request.headers["Content-Range"]
+        m = re.match(r"^(\d+)-(\d+)$", cr)
+        assert m
+        end = int(m.group(2))
+        received.extend(request.data)
+        # 200 instead of 202 — the Artifactory non-conformance we're testing.
+        return Response(
+            "",
+            status=200,
+            headers={
+                "Location": httpserver.url_for("/upload/jfrog"),
+                "Range": f"0-{end}",
+            },
+        )
+
+    httpserver.expect_request("/upload/jfrog", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/upload/jfrog", method="PUT").respond_with_data("", status=201)
+
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client, repo="repo", chunk_size=64, max_retries=3, backoff_initial=0.0
+    )
+    upload.write(payload)
+    upload.close()
+
+    # 200 bytes / 64-byte chunks → 3 PATCH (64+64+64) + remainder via PUT.
+    # If 200 isn't accepted, we'd see >3 attempts (re-PATCH) or a hang.
+    assert patch_count["n"] == 3, (
+        f"200 must be treated as success — one PATCH per chunk; got {patch_count['n']}"
+    )
+    assert bytes(received) == payload[:192]
+
+
+def test_unhandled_patch_status_raises_instead_of_looping(httpserver: HTTPServer):
+    """Belt-and-braces: any status the loop doesn't explicitly handle must
+    surface as an error, not silently spin. Before the 200 fix, a 2xx
+    non-202/non-200 response would fall through `raise_for_status()` (no-op
+    on 2xx) and re-iterate without progress or budget decrement → infinite
+    loop. We pick 299 (a 2xx code with no spec meaning) to confirm we no
+    longer trust 'anything 2xx that isn't 202'."""
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/weird")}
+    )
+    # 416 fallback resync would also need handling; register so we fail on
+    # the actual error rather than on an unmatched route.
+    httpserver.expect_request("/upload/weird", method="GET").respond_with_data(
+        "", status=204, headers={"Range": "0-0"}
+    )
+    httpserver.expect_request("/upload/weird", method="PATCH").respond_with_data("", status=299)
+
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client, repo="repo", chunk_size=64, max_retries=3, backoff_initial=0.0
+    )
+    with pytest.raises(RuntimeError, match=r"unexpected.*299|status 299"):
+        upload.write(b"Z" * 128)
+
+
 def test_chunked_upload_does_not_retry_on_proxy_error(httpserver: HTTPServer):
     httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
         "", status=202, headers={"Location": httpserver.url_for("/upload/px")}
