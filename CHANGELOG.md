@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **PATCH retry no longer loops on 416 after partial server commit.** When a
+  transient PATCH failure (SSL EOF, 5xx, ChunkedEncodingError) coincided
+  with the registry committing some bytes server-side, the retry was
+  re-sending the full chunk under the original `Content-Range`. The server
+  rejected with 416 forever and the upload exhausted retries even though
+  it was making real progress. `_patch_with_retry` now recomputes the
+  slice and Content-Range start from the live `server_offset` at the top
+  of each attempt; retries only carry the bytes that haven't been acked yet.
+
+### Changed
+- **PATCH retry budget refreshes when the server makes progress.** Hostile
+  proxies that drop SSL mid-stream but let the registry commit a few bytes
+  per attempt previously exhausted `--oci-max-retries` quickly. Now, if
+  `server_offset` walked forward between iterations, the budget is
+  restored — long uploads can survive an arbitrary number of cuts as long
+  as each one yields some bytes. Only consecutive zero-progress failures
+  consume the budget. Pattern borrowed from
+  `huggingface_hub.file_download.http_get`.
+- **Resync GET goes on a fresh connection.** A mid-stream PATCH cut may
+  leave a half-dead SSL socket in urllib3's pool; reusing it for the
+  follow-up GET would fail on the very thing we're trying to recover
+  from. `_resync` now closes the adapter's pool before issuing the GET.
+- **Backoff switches to full jitter** (AWS Architecture pattern,
+  `Uniform(0, min(cap, base × 2^attempt))`) in both `oci.py` PATCH retry
+  and `hf.py` HF stream retry. Wider spread is meaningful when many
+  workers retry against a recovering proxy at once — the previous narrow
+  10% jitter band invited synchronized retry storms.
+
 ## [0.5.0] - 2026-05-08
 
 ### Added
