@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import shutil
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,8 +13,8 @@ from typing import Any
 
 from oci_modelcar.config import Config
 from oci_modelcar.download import HfDownloader, HfFile
-from oci_modelcar.errors import ConfigError, PushError
-from oci_modelcar.layer import build_layer_to_file
+from oci_modelcar.errors import ConfigError, DiskSpaceError, PushError
+from oci_modelcar.layer import build_layer_to_file, tar_layer_size
 from oci_modelcar.logging import PipelineLogger
 from oci_modelcar.manifest import ML_MAN, ML_TAR, BlobDescriptor, derive_tag
 from oci_modelcar.registry import OciClient, StreamingBlobUpload
@@ -199,3 +200,26 @@ class Pipeline:
 
         target_tag = derive_tag(revision, explicit=self.cfg.target_tag)
         return revision, files, target_tag
+
+    def _check_disk_space(self, files: list[HfFile]) -> None:
+        if not files:
+            return
+        max_layer = max(tar_layer_size(f.size) for f in files)
+        max_source = max(f.size for f in files)
+        total_sources = sum(f.size for f in files)
+
+        in_flight = (max_source + max_layer) * self.cfg.workers * 1.2
+        persistent = 0 if self.cfg.clean_hf_after_push else int(total_sources * 1.05)
+        needed = int(in_flight + persistent)
+
+        self.cfg.spool_dir.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(self.cfg.spool_dir).free
+        if free < needed:
+            raise DiskSpaceError(
+                f"Need {needed / 1e9:.1f} GB free in {self.cfg.spool_dir}, "
+                f"only {free / 1e9:.1f} GB available.",
+                hint=(
+                    f"--spool-dir <other-volume>, --clean-hf-after-push, "
+                    f"or lower --workers (currently {self.cfg.workers})."
+                ),
+            )

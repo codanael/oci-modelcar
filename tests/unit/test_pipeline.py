@@ -203,3 +203,58 @@ def test_pipeline_preflight_no_files_raises_config(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="no files matched"):
         pipeline._preflight()
+
+
+# ---------------------------------------------------------------------------
+# Task 8.4: Pipeline disk space check
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_disk_space_passes_when_sufficient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, plog = _build_pipeline(tmp_path)
+    pipeline = Pipeline(cfg, plog, downloader=MagicMock(), registry_client=MagicMock())
+    files = [HfFile("a.bin", 1000, None), HfFile("b.bin", 2000, None)]
+    # Plenty of space
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 10 * 1024**3})(),
+    )
+    pipeline._check_disk_space(files)  # should not raise
+
+
+def test_pipeline_disk_space_fails_with_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from oci_modelcar.errors import DiskSpaceError
+
+    cfg, plog = _build_pipeline(tmp_path, workers=4)
+    pipeline = Pipeline(cfg, plog, downloader=MagicMock(), registry_client=MagicMock())
+    files = [HfFile("big.bin", 10 * 1024**3, None)]  # 10 GiB file
+    # Only 5 GB free cannot fit (need 4 x 10 GiB workers + sources)
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 5 * 1024**3})(),
+    )
+    with pytest.raises(DiskSpaceError) as exc:
+        pipeline._check_disk_space(files)
+    assert exc.value.hint and "--clean-hf-after-push" in exc.value.hint
+
+
+def test_pipeline_disk_space_clean_hf_lowers_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With --clean-hf-after-push, the persistent budget drops to 0; only
+    workers x max_layer is required."""
+    cfg, plog = _build_pipeline(tmp_path, workers=1, clean_hf_after_push=True)
+    pipeline = Pipeline(cfg, plog, downloader=MagicMock(), registry_client=MagicMock())
+    files = [HfFile(f"f{i}.bin", 1024**3, None) for i in range(20)]  # 20 GB total
+
+    # 5 GB free should suffice with --clean-hf-after-push because we only need
+    # ~1.2 x (1 + 1) GB in flight (rounded up).
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 5 * 1024**3})(),
+    )
+    pipeline._check_disk_space(files)  # should not raise
