@@ -1,10 +1,17 @@
 import hashlib
+import json
 
 import pytest
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
-from oci_modelcar.registry import OciClient, head_blob, push_small_blob
+from oci_modelcar.registry import (
+    OciClient,
+    head_blob,
+    push_manifest,
+    push_small_blob,
+    validate_manifest_tag,
+)
 
 
 def _client(httpserver: HTTPServer) -> OciClient:
@@ -111,3 +118,39 @@ def test_push_small_blob_post_then_put(httpserver):
     out = push_small_blob(_client(httpserver), "repo", data)
     assert out == digest
     assert received["data"] == data
+
+
+def test_push_manifest_returns_digest(httpserver):
+    body = json.dumps({"schemaVersion": 2, "config": {}, "layers": []}).encode()
+    expected_digest = "sha256:" + hashlib.sha256(body).hexdigest()
+
+    received = {"data": b""}
+
+    def put_handler(request):
+        received["data"] = request.data
+        return Response("", status=201)
+
+    httpserver.expect_request("/v2/repo/manifests/v1", method="PUT").respond_with_handler(
+        put_handler
+    )
+    out = push_manifest(_client(httpserver), "repo", "v1", body)
+    assert out == expected_digest
+    assert received["data"] == body
+
+
+def test_validate_manifest_tag_succeeds_on_match(httpserver):
+    digest = "sha256:" + "a" * 64
+    httpserver.expect_request("/v2/repo/manifests/v1", method="GET").respond_with_data(
+        "", status=200, headers={"Docker-Content-Digest": digest}
+    )
+    validate_manifest_tag(_client(httpserver), "repo", "v1", digest)
+
+
+def test_validate_manifest_tag_raises_on_mismatch(httpserver):
+    digest = "sha256:" + "a" * 64
+    other = "sha256:" + "b" * 64
+    httpserver.expect_request("/v2/repo/manifests/v1", method="GET").respond_with_data(
+        "", status=200, headers={"Docker-Content-Digest": other}
+    )
+    with pytest.raises(RuntimeError, match="manifest digest mismatch"):
+        validate_manifest_tag(_client(httpserver), "repo", "v1", digest)
