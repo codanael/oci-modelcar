@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -40,6 +41,7 @@ def process_one_file(
     hf_max_retries: int = 10,
     oci_max_retries: int = 10,
     backoff_initial: float = 1.0,
+    progress_cb: Callable[[int], None] | None = None,
 ) -> tuple[BlobDescriptor, str]:
     """Stream one HF file as one tar layer; returns (descriptor, diff_id).
 
@@ -52,6 +54,7 @@ def process_one_file(
         size=hf_file.size,
         max_retries=hf_max_retries,
         backoff_initial=backoff_initial,
+        progress_cb=progress_cb,
     )
     upload = ChunkedBlobUpload(
         client=oci_client,
