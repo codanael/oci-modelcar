@@ -1,5 +1,6 @@
 import hashlib
 import re
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -125,6 +126,57 @@ def test_chunked_upload_does_not_retry_on_ssl_error(httpserver: HTTPServer):
     ):
         upload.write(b"Z" * 128)  # forces flush of one 64-byte chunk
     assert calls["n"] == 1, f"expected 1 PATCH attempt, got {calls['n']}"
+
+
+def test_chunked_upload_retries_on_ssl_eof_mid_stream(httpserver: HTTPServer):
+    """SSL EOF on a PATCH after bytes flowed = mid-stream connection cut, must
+    retry via _resync — same semantics as ConnectionError. Only handshake-time
+    SSL errors are fatal."""
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/eof")}
+    )
+    # _resync GET — declares we're at offset 64 already (so the next PATCH for
+    # the next chunk is fine; the failed one is replayed against a server that
+    # behaves correctly).
+    httpserver.expect_request("/upload/eof", method="GET").respond_with_data(
+        "", status=204, headers={"Range": "0-0"}
+    )
+    received = bytearray()
+
+    def patch_handler(request: Any) -> Response:
+        received.extend(request.data)
+        return Response(
+            "",
+            status=202,
+            headers={
+                "Location": httpserver.url_for("/upload/eof"),
+                "Range": f"0-{len(received) - 1}",
+            },
+        )
+
+    client = _client(httpserver)
+    upload = ChunkedBlobUpload(
+        client, repo="repo", chunk_size=64, max_retries=10, backoff_initial=0.0
+    )
+
+    calls = {"n": 0}
+    real_patch = requests.Session.patch
+
+    def flaky_patch(self: requests.Session, *args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.exceptions.SSLError(
+                "EOF occurred in violation of protocol (_ssl.c:2437)"
+            )
+        return real_patch(self, *args, **kwargs)
+
+    httpserver.expect_request("/upload/eof", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/upload/eof", method="PUT").respond_with_data("", status=201)
+
+    with patch.object(requests.Session, "patch", flaky_patch):
+        upload.write(b"Z" * 128)
+        upload.close()
+    assert calls["n"] >= 2, "must have retried after SSL EOF"
 
 
 def test_chunked_upload_does_not_retry_on_proxy_error(httpserver: HTTPServer):
