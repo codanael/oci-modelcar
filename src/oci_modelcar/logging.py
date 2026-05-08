@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import IO, Literal
 
@@ -198,6 +199,46 @@ class PipelineLogger:
             yield scoped
         finally:
             scoped.flush()
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-readable byte count using GB/MB/KB scaling."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f} GB"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f} MB"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f} KB"
+    return f"{n} B"
+
+
+class ProgressEmitter:
+    """Throttled progress reporter: emits at most once per `interval` seconds."""
+
+    def __init__(
+        self,
+        emit: Callable[[str], None],
+        path: str,
+        total: int,
+        interval: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._emit = emit
+        self._path = path
+        self._total = total
+        self._interval = interval
+        self._clock = clock
+        self._last = clock()
+
+    def update(self, transferred: int) -> None:
+        now = self._clock()
+        if now - self._last < self._interval:
+            return
+        self._last = now
+        pct = 100.0 * transferred / self._total if self._total > 0 else 0.0
+        self._emit(
+            f"{self._path}: {pct:.0f}% ({_fmt_bytes(transferred)} / {_fmt_bytes(self._total)})"
+        )
 
 
 class FileScopedLogger:
