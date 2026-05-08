@@ -84,6 +84,16 @@ def build_session() -> requests.Session:
 
     Non-idempotent methods (PATCH, PUT) are NOT retried automatically;
     those have their own resync-aware retry logic in oci.py.
+
+    Two diagnostic env vars (opt-in, defaults unchanged) help isolate
+    proxy/AV behavior that treats specific clients differently:
+
+    - ``OCI_MODELCAR_USER_AGENT``: override the default User-Agent. Useful
+      when a proxy whitelists wget but mangles ``python-requests``.
+    - ``OCI_MODELCAR_FORCE_CONNECTION_CLOSE=1``: send ``Connection: close``
+      on every request, disabling keep-alive. Useful when a proxy
+      mishandles long-lived TLS connections (mid-stream EOF after AV
+      pass-through threshold, idle eviction, etc.).
     """
     s = requests.Session()
     retry = _SmartRetry(
@@ -96,7 +106,16 @@ def build_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    s.headers["User-Agent"] = f"oci-modelcar/{__version__}"
+    s.headers["User-Agent"] = (
+        os.environ.get("OCI_MODELCAR_USER_AGENT") or f"oci-modelcar/{__version__}"
+    )
+    if os.environ.get("OCI_MODELCAR_FORCE_CONNECTION_CLOSE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        s.headers["Connection"] = "close"
     return s
 
 

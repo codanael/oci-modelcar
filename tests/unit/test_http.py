@@ -71,6 +71,37 @@ def test_build_session_has_user_agent():
     assert "oci-modelcar/" in s.headers["User-Agent"]
 
 
+def test_build_session_user_agent_override_via_env(monkeypatch):
+    """OCI_MODELCAR_USER_AGENT lets users mimic wget/curl when a proxy/AV
+    treats the python-requests UA differently. Diagnostic-only knob."""
+    monkeypatch.setenv("OCI_MODELCAR_USER_AGENT", "Wget/1.21.4")
+    s = build_session()
+    assert s.headers["User-Agent"] == "Wget/1.21.4"
+
+
+def test_build_session_no_connection_close_by_default(monkeypatch):
+    """requests.Session ships Connection: keep-alive by default; we leave that
+    untouched unless explicitly opted in."""
+    monkeypatch.delenv("OCI_MODELCAR_FORCE_CONNECTION_CLOSE", raising=False)
+    s = build_session()
+    assert s.headers.get("Connection", "").lower() != "close"
+
+
+def test_build_session_force_connection_close_via_env(monkeypatch):
+    """OCI_MODELCAR_FORCE_CONNECTION_CLOSE=1 disables HTTP keep-alive on every
+    request. Diagnostic-only: useful when a proxy mishandles long-lived TLS
+    connections (mid-stream EOF after AV pass-through, etc.)."""
+    monkeypatch.setenv("OCI_MODELCAR_FORCE_CONNECTION_CLOSE", "1")
+    s = build_session()
+    assert s.headers["Connection"] == "close"
+
+
+def test_build_session_force_connection_close_falsy_values_ignored(monkeypatch):
+    monkeypatch.setenv("OCI_MODELCAR_FORCE_CONNECTION_CLOSE", "0")
+    s = build_session()
+    assert s.headers.get("Connection", "").lower() != "close"
+
+
 def test_docker_config_auth_handles_missing(tmp_path):
     assert docker_config_auth(tmp_path / "missing.json", "x") is None
 
