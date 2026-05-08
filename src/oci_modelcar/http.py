@@ -26,6 +26,30 @@ _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
 )
 
 
+def _is_transient_ssl(exc: BaseException) -> bool:
+    """True if `exc` is an SSL error whose root cause is a mid-stream EOF
+    (the connection got cut after the handshake succeeded), as opposed to a
+    handshake-time misconfig (CA invalid, hostname mismatch, expired cert).
+
+    Mid-stream EOFs happen on long transfers when an idle proxy or firewall
+    rotates or times out the TCP connection — fully recoverable via Range
+    resume / OCI session resync, so they must be retried like any other
+    transient cut. Used by `HfStream._next_chunk` and
+    `ChunkedBlobUpload._patch_with_retry` to override the default
+    fatal-on-SSLError verdict for this specific case.
+    """
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ssl.SSLEOFError):
+            return True
+        if "EOF occurred in violation of protocol" in str(cur):
+            return True
+        cur = cur.__cause__
+    return False
+
+
 class _SmartRetry(Retry):
     """Retry policy that surfaces non-recoverable errors immediately.
 

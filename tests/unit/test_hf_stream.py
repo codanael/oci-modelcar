@@ -164,6 +164,48 @@ def test_hfstream_does_not_retry_on_ssl_error(httpserver: HTTPServer):
     assert iter_calls["n"] == 1, f"expected 1 iter_content call, got {iter_calls['n']}"
 
 
+def test_hfstream_retries_on_ssl_eof_mid_stream(httpserver: HTTPServer):
+    """An SSL EOF mid-stream (after handshake succeeded and bytes flowed) is a
+    network blip, not a CA misconfig — must resume via Range like other transient
+    errors. Regression seen on a 1.34 GB shard cut by an idle-proxy timeout.
+    """
+    payload = b"A" * 100
+
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    httpserver.expect_oneshot_request("/foo/bar/resolve/main/file.bin").respond_with_handler(
+        _make_short_handler(payload, start=30, deliver=70, total=100)
+    )
+
+    real_iter_content = requests.Response.iter_content
+    call_count = {"n": 0}
+
+    def flaky_iter_content(self: requests.Response, chunk_size: int = 1) -> Any:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            yield payload[:30]
+            raise requests.exceptions.SSLError(
+                "EOF occurred in violation of protocol (_ssl.c:2437)"
+            )
+        yield from real_iter_content(self, chunk_size=chunk_size)
+
+    client = _make_client(httpserver)
+    with patch.object(requests.Response, "iter_content", flaky_iter_content):
+        stream = HfStream(
+            client,
+            revision="main",
+            path="file.bin",
+            size=len(payload),
+            max_retries=3,
+            backoff_initial=0.0,
+            chunk_size=10,
+        )
+        out = stream.read(-1)
+    assert out == payload
+    assert call_count["n"] >= 2, "must have retried after SSL EOF"
+
+
 def test_hfstream_does_not_retry_on_proxy_error(httpserver: HTTPServer):
     payload = b"Y" * 100
     httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
