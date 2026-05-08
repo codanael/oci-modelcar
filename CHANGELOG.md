@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-08
+
 ### Fixed
 - HuggingFace download retries now absorb the full set of transport-layer
   failure modes (`urllib3.exceptions.ProtocolError`, `http.client.IncompleteRead`,
