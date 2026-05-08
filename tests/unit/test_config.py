@@ -66,3 +66,71 @@ def test_config_verbose_quiet_mutually_exclusive(monkeypatch):
     monkeypatch.setenv("LOG_QUIET", "1")
     with pytest.raises(ConfigError, match="mutually exclusive"):
         Config.from_env_and_args([])
+
+
+def test_config_spool_dir_default(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.delenv("SPOOL_DIR", raising=False)
+    cfg = Config.from_env_and_args([])
+    assert cfg.spool_dir.name == "oci-modelcar"
+
+
+def test_config_spool_dir_cli(monkeypatch, tmp_path):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--spool-dir", str(tmp_path)])
+    assert cfg.spool_dir == tmp_path
+
+
+def test_config_spool_dir_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("SPOOL_DIR", str(tmp_path))
+    cfg = Config.from_env_and_args([])
+    assert cfg.spool_dir == tmp_path
+
+
+def test_config_clean_hf_after_push_default_false(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.delenv("CLEAN_HF_AFTER_PUSH", raising=False)
+    cfg = Config.from_env_and_args([])
+    assert cfg.clean_hf_after_push is False
+
+
+def test_config_clean_hf_after_push_cli(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--clean-hf-after-push"])
+    assert cfg.clean_hf_after_push is True
+
+
+def test_config_clean_hf_after_push_env(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("CLEAN_HF_AFTER_PUSH", "1")
+    cfg = Config.from_env_and_args([])
+    assert cfg.clean_hf_after_push is True
+
+
+def test_config_oci_max_retries_default_5(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args([])
+    assert cfg.oci_max_retries == 5
+
+
+def test_config_continue_on_error_overrides_fail_fast(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--continue-on-error"])
+    assert cfg.fail_fast is False
