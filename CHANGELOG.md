@@ -2,111 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.0.0] - 2026-05-08
 
 ### Added
-- **Streaming upload mode (now the default).** New
-  `StreamingBlobUpload` issues a single PATCH per blob with the body
-  sourced from a byte iterator and `Content-Length` set upfront — same
-  wire shape as `containers/image` (Podman, Skopeo, `docker_image_dest.go:
-  PutBlobWithOptions`) and Jib (`BlobPusher.java`). Eliminates per-PATCH
-  load-balancer routing decisions on registries that lack sticky session
-  affinity (Artifactory HA cluster, Harbor + reverse proxy): one PATCH =
-  one TCP request = one routing decision, so the entire blob lands on
-  one node.
-  - `--upload-mode streaming` (env `OCI_MODELCAR_UPLOAD_MODE=streaming`)
-    is now the default. The previous chunked behavior remains available
-    via `--upload-mode chunked`, which keeps intra-blob retry on transient
-    cuts and is preferable on extremely flaky links where mid-blob
-    resumption matters more than cluster compatibility.
-  - Tradeoff: streaming mode has no intra-blob retry. A mid-PATCH cut
-    surfaces immediately and the runner handles file-level retry across
-    runs via `state.json`.
-  - Per-worker memory in streaming mode is bounded by the producer/
-    consumer pipe (~8 MiB) regardless of `--chunk-mib`. Chunked mode
-    remains O(2 × chunk_mib) per worker.
-  - New helper `tar_layer.tar_layer_size(file_size)` computes the exact
-    tar-layer byte count deterministically (header + body + trailer
-    padded to RECORDSIZE = 10240) so streaming PATCH can declare
-    `Content-Length` upfront.
+- Per-file pipeline (download → tar → push → cleanup) parallelized via `--workers`.
+- `huggingface_hub.HfApi` for metadata (revision resolve, file listing,
+  LFS sha256 detection); bytes streamed by our own code so mid-stream
+  cancellation works on multi-GB downloads.
+- Atomic write semantics for downloaded files (`.partial` → rename).
+- Cross-origin Authorization stripping on HF→S3 redirects (security).
+- Expanded HF token sources: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+  `~/.cache/huggingface/token`, opt-out via `HF_HUB_DISABLE_IMPLICIT_TOKEN=1`.
+- Range-200 fallback (server ignores Range → truncate + restart) ported
+  from huggingface_hub.
+- Specific error classes: `GatedRepoError`, `RevisionNotFoundError`,
+  `EntryNotFoundError`, `DiskSpaceError`, `PushError`, `PartialFailureError`.
+- Per-class CI exit codes: 0/1/2/3/4/5/6/7.
+- `--spool-dir`, `--clean-hf-after-push` flags + matching env vars.
+- Tag conflict policy: skip on match, refuse without `--force`, overwrite
+  with `--force`.
+- Mode-aware disk space pre-flight check (with/without `--clean-hf-after-push`).
 
 ### Changed
-- **`--chunk-mib` cap raised from 1024 (1 GiB) to 65536 (64 GiB).** Default
-  remains 32 MiB. Large values are now permitted to mitigate Artifactory
-  HA cluster + load balancer setups that lack sticky session affinity:
-  each PATCH on the upload session can be routed to a different node,
-  causing 500s like `failed to stream binary to sub provider` and
-  `Binary info is only available after successful read of the entire
-  stream`, plus a stream of 200/204 non-spec responses and SSL EOFs as
-  partial state confuses the cluster. Setting `--chunk-mib >= largest
-  layer size` collapses the upload into a single PATCH per blob — same
-  shape as `containers/image` (Podman, Skopeo) and Jib, both of which
-  stream the full blob in one PATCH (`docker_image_dest.go:PutBlobWithOptions`,
-  `BlobPusher.java`). One PATCH = one TCP request = one LB routing
-  decision, eliminating the per-PATCH split. Per-worker peak RAM is
-  ~2x `chunk_mib`; the runner logs the chosen size when it exceeds 1 GiB.
+- **Single PATCH per blob from local file (Jib-style replay-on-cut).**
+  Eliminates per-PATCH LB routing decisions on misconfigured Artifactory
+  HA clusters. Same wire shape as containers/image and Jib.
+- Default `--oci-max-retries` lowered from 10 to 5 (each retry is a full
+  PATCH replay; bandwidth ballooning on systematic failures otherwise).
+- Tar layer size formula now exposed as `layer.tar_layer_size(file_size)`.
 
-### Fixed
-- **PATCH chunk commit accepts `200`/`201`/`202`/`204` (was `202` only).**
-  OCI Distribution v1.1 mandates `202 Accepted` on chunk commit, but real
-  registries diverge: Artifactory returns `200` or `204`, and Harbor
-  behind reverse proxies has been observed returning `204`. The two
-  canonical OCI client libraries already handle this — go-containerregistry
-  (`streamBlob`) accepts `{201, 202, 204}`, oras-py (`_check_200_response`)
-  accepts `{200, 201, 202}` — but `oci-modelcar` matched only `202`. A
-  non-202 success fell through `raise_for_status()` (a no-op on 2xx) and
-  re-iterated the retry loop without advancing `server_offset` or
-  decrementing `attempts_left` — an infinite re-PATCH of the same range,
-  burning bandwidth until a middlebox cut the TLS connection mid-stream
-  (presenting as a misleading "PATCH SSL EOF, retries exhausted" error).
-  `_patch_with_retry` now accepts the union `{200, 201, 202, 204}`. Also
-  adds a guard: any unexpected non-spec status (other 2xx/3xx) raises
-  explicitly rather than silently spinning.
-- **PATCH retry no longer loops on 416 after partial server commit.** When a
-  transient PATCH failure (SSL EOF, 5xx, ChunkedEncodingError) coincided
-  with the registry committing some bytes server-side, the retry was
-  re-sending the full chunk under the original `Content-Range`. The server
-  rejected with 416 forever and the upload exhausted retries even though
-  it was making real progress. `_patch_with_retry` now recomputes the
-  slice and Content-Range start from the live `server_offset` at the top
-  of each attempt; retries only carry the bytes that haven't been acked yet.
+### Removed
+- `state.json` and the `state.py` module entirely. Registry HEAD is
+  the source of truth for resumability and idempotency.
+- `ChunkedBlobUpload` and chunked PATCH mode.
+- `--state-file`, `--chunk-mib`, `--upload-mode` flags. Use `--spool-dir`
+  and `--clean-hf-after-push` for the new disk model.
+- `_PipeBuffer` thread-bridge (per-file pipeline replaces it).
+- `tags.py` (`derive_tag` migrated into `manifest.py`).
 
-### Changed
-- **PATCH retry budget refreshes when the server makes progress.** Hostile
-  proxies that drop SSL mid-stream but let the registry commit a few bytes
-  per attempt previously exhausted `--oci-max-retries` quickly. Now, if
-  `server_offset` walked forward between iterations, the budget is
-  restored — long uploads can survive an arbitrary number of cuts as long
-  as each one yields some bytes. Only consecutive zero-progress failures
-  consume the budget. Pattern borrowed from
-  `huggingface_hub.file_download.http_get`.
-- **Resync GET goes on a fresh connection.** A mid-stream PATCH cut may
-  leave a half-dead SSL socket in urllib3's pool; reusing it for the
-  follow-up GET would fail on the very thing we're trying to recover
-  from. `_resync` now closes the adapter's pool before issuing the GET.
-- **Backoff switches to full jitter** (AWS Architecture pattern,
-  `Uniform(0, min(cap, base × 2^attempt))`) in both `oci.py` PATCH retry
-  and `hf.py` HF stream retry. Wider spread is meaningful when many
-  workers retry against a recovering proxy at once — the previous narrow
-  10% jitter band invited synchronized retry storms.
-
-### Added (diagnostic)
-- **Three opt-in env vars in `http.py`** to help isolate proxy/AV
-  behavior when `oci-modelcar` fails where `wget` succeeds:
-  - `OCI_MODELCAR_USER_AGENT=...` — override the default UA.
-  - `OCI_MODELCAR_FORCE_CONNECTION_CLOSE=1` — disable HTTP keep-alive.
-  - `OCI_MODELCAR_DEBUG_HTTP=1` — turn on `urllib3` + `http.client`
-    wire-level debug logging (request line, headers sent, response
-    status & headers, connection events, retry telemetry). Substitute
-    for tcpdump when TLS capture is impractical.
-  Defaults unchanged.
-- **`tools/hf_download_probe.py`** — standalone diagnostic that
-  downloads the same URL via wget, curl, and Python `requests`,
-  reporting bytes/time/throughput/error per backend. Levers:
-  `--connection-close`, `--user-agent`, `--chunk-size`,
-  `--range-start/--range-end` (bracket past AV thresholds),
-  `--insecure`, `--max-bytes`, `--debug-http`. Useful in airgapped
-  environments where the failure only reproduces on-site.
+### Security
+- HF Authorization tokens are no longer forwarded on cross-origin
+  redirects. Previous versions could leak a Bearer token to S3 /
+  CloudFront (HF's redirect target for LFS files), where the request
+  was rejected but the token may have been logged.
 
 ## [0.5.0] - 2026-05-08
 
