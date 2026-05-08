@@ -95,7 +95,7 @@ class RunResult:
 
 def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     hf_client = HfClient(endpoint=cfg.hf_endpoint, repo=cfg.hf_repo)
-    oci_client = OciClient(registry_host=cfg.registry)
+    oci_client = OciClient(registry_host=cfg.registry, target_repo=cfg.target_repo)
 
     plog.section("Resolving HuggingFace revision")
     revision_resolved = hf_client.resolve_revision(cfg.hf_revision)

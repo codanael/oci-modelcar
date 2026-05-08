@@ -95,3 +95,29 @@ def test_oci_client_loopback_127():
     assert _is_loopback("::1")
     assert not _is_loopback("registry.example.com")
     assert not _is_loopback("10.0.0.1")
+
+
+def test_oci_client_passes_target_repo_to_auth(monkeypatch, tmp_path):
+    """OciClient.auth must include target_repo so path-keyed auth.json entries match."""
+    import base64
+    import json
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg_dir = tmp_path / ".docker"
+    cfg_dir.mkdir()
+    raw = base64.b64encode(b"u:p").decode()
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"auths": {"artifactory.example/myproject": {"auth": raw}}})
+    )
+
+    # Without target_repo, the bare host has no entry → auth empty
+    client = OciClient(registry_host="artifactory.example")
+    assert client.auth == {}
+
+    # With target_repo plumbed in, longest-prefix match resolves
+    client = OciClient(registry_host="artifactory.example", target_repo="myproject/model")
+    assert client.auth == {"Authorization": f"Basic {raw}"}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import ssl
 from pathlib import Path
@@ -15,6 +16,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from oci_modelcar import __version__
+
+log = logging.getLogger(__name__)
 
 _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
     ssl.SSLError,
@@ -67,36 +70,78 @@ def build_session() -> requests.Session:
     return s
 
 
-def oci_auth_header(registry_host: str) -> dict[str, str]:
+def oci_auth_header(
+    registry_host: str,
+    target_repo: str | None = None,
+) -> dict[str, str]:
     """Resolve registry auth in priority order.
 
     1. OCI_USERNAME + OCI_PASSWORD env
     2. ~/.docker/config.json
-    3. $XDG_RUNTIME_DIR/containers/auth.json
+    3. $XDG_RUNTIME_DIR/containers/auth.json (rootless podman)
+    4. $XDG_CONFIG_HOME/containers/auth.json (default $HOME/.config/...)
+
+    When `target_repo` is provided, sources are queried with the full
+    `host/repo` path so that auths keyed at a sub-path (e.g.
+    `artifactory.example/myproject`) win via longest-prefix match.
+
+    Logs a one-line INFO marker for the resolved source, or a WARNING when
+    no source matches and the push falls back to anonymous.
     """
+    target = f"{registry_host}/{target_repo}" if target_repo else registry_host
+
     user = os.environ.get("OCI_USERNAME")
     pwd = os.environ.get("OCI_PASSWORD")
     if user and pwd is not None:
+        log.info("OCI auth resolved from OCI_USERNAME/OCI_PASSWORD env")
         token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
         return {"Authorization": f"Basic {token}"}
 
-    docker_cfg = Path.home() / ".docker" / "config.json"
-    auth = docker_config_auth(docker_cfg, registry_host)
-    if auth:
-        return {"Authorization": f"Basic {auth}"}
-
-    xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg:
-        containers_cfg = Path(xdg) / "containers" / "auth.json"
-        auth = docker_config_auth(containers_cfg, registry_host)
+    for path in _auth_search_paths():
+        auth = docker_config_auth(path, target)
         if auth:
+            log.info("OCI auth resolved from %s", path)
             return {"Authorization": f"Basic {auth}"}
 
+    log.warning(
+        "no OCI credentials found for %s — pushing anonymously (set OCI_USERNAME/OCI_PASSWORD "
+        "or run `podman login`/`docker login`)",
+        target,
+    )
     return {}
 
 
-def docker_config_auth(path: Path, registry_host: str) -> str | None:
-    """Read a docker/podman config.json and return the base64 auth blob if any."""
+def _auth_search_paths() -> list[Path]:
+    """Ordered list of auth.json paths to consult (most specific first)."""
+    paths = [Path.home() / ".docker" / "config.json"]
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        paths.append(Path(xdg_runtime) / "containers" / "auth.json")
+    xdg_config = os.environ.get("XDG_CONFIG_HOME")
+    config_root = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    paths.append(config_root / "containers" / "auth.json")
+    return paths
+
+
+def _normalize_auth_key(key: str) -> str:
+    """Strip http(s):// prefix, /v2/ trailing path, and trailing slashes."""
+    for prefix in ("https://", "http://"):
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+            break
+    key = key.rstrip("/")
+    if key.endswith("/v2"):
+        key = key[: -len("/v2")].rstrip("/")
+    return key
+
+
+def docker_config_auth(path: Path, target: str) -> str | None:
+    """Read a docker/podman config.json and return the base64 auth blob if any.
+
+    `target` may be a bare host or `host/repo`. Auths keys are normalized
+    (`https://`, `/v2/`, trailing `/` stripped) and the longest normalized
+    key that is a prefix of `target` wins.
+    """
     if not path.is_file():
         return None
     try:
@@ -106,7 +151,20 @@ def docker_config_auth(path: Path, registry_host: str) -> str | None:
     except json.JSONDecodeError:
         return None
     auths = data.get("auths", {})
-    entry = auths.get(registry_host)
+    if not isinstance(auths, dict):
+        return None
+
+    best_key: str | None = None
+    best_len = -1
+    for raw_key in auths:
+        norm = _normalize_auth_key(raw_key)
+        matches = norm == target or target.startswith(norm + "/")
+        if matches and len(norm) > best_len:
+            best_len = len(norm)
+            best_key = raw_key
+    if best_key is None:
+        return None
+    entry = auths[best_key]
     if not isinstance(entry, dict):
         return None
     raw = entry.get("auth")

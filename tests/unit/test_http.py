@@ -73,6 +73,133 @@ def test_docker_config_auth_handles_missing(tmp_path):
     assert docker_config_auth(tmp_path / "missing.json", "x") is None
 
 
+def test_docker_config_auth_longest_prefix_match(tmp_path):
+    """auths['host/repo'] matches target 'host/repo' AND deeper paths."""
+    cfg = tmp_path / "auth.json"
+    raw = base64.b64encode(b"u:p").decode()
+    cfg.write_text(json.dumps({"auths": {"artifactory.example/repo": {"auth": raw}}}))
+    # Exact match
+    assert docker_config_auth(cfg, "artifactory.example/repo") == raw
+    # Sub-path: target = host/repo/something — must match the host/repo entry
+    assert docker_config_auth(cfg, "artifactory.example/repo/sub") == raw
+    # Bare host: target = host alone — must NOT match a more specific entry
+    assert docker_config_auth(cfg, "artifactory.example") is None
+    # Different repo prefix: must not cross-match
+    assert docker_config_auth(cfg, "artifactory.example/other") is None
+
+
+def test_docker_config_auth_picks_most_specific_match(tmp_path):
+    """When several keys match, the longest wins."""
+    cfg = tmp_path / "auth.json"
+    bare = base64.b64encode(b"bare:x").decode()
+    deep = base64.b64encode(b"deep:y").decode()
+    cfg.write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "artifactory.example": {"auth": bare},
+                    "artifactory.example/repo": {"auth": deep},
+                }
+            }
+        )
+    )
+    assert docker_config_auth(cfg, "artifactory.example/repo") == deep
+    assert docker_config_auth(cfg, "artifactory.example/other") == bare
+
+
+def test_docker_config_auth_normalizes_legacy_keys(tmp_path):
+    """Legacy docker keys with https:// prefix or /v2/ suffix still match."""
+    cfg = tmp_path / "auth.json"
+    a = base64.b64encode(b"a:1").decode()
+    b = base64.b64encode(b"b:2").decode()
+    cfg.write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "https://legacy.example/v2/": {"auth": a},
+                    "https://other.example/": {"auth": b},
+                }
+            }
+        )
+    )
+    assert docker_config_auth(cfg, "legacy.example") == a
+    assert docker_config_auth(cfg, "other.example/repo") == b
+
+
+def test_oci_auth_header_uses_target_repo(monkeypatch, tmp_path):
+    """oci_auth_header passes target_repo so path-keyed auths match."""
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg_dir = tmp_path / ".docker"
+    cfg_dir.mkdir()
+    raw = base64.b64encode(b"who:cares").decode()
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"auths": {"artifactory.example/myproject": {"auth": raw}}})
+    )
+    # Without target_repo: bare host has no entry → no auth
+    assert oci_auth_header("artifactory.example") == {}
+    # With target_repo: longest-prefix match resolves
+    hdr = oci_auth_header("artifactory.example", target_repo="myproject/model")
+    assert hdr == {"Authorization": f"Basic {raw}"}
+
+
+def test_oci_auth_header_searches_xdg_config_home(monkeypatch, tmp_path):
+    """Podman default $HOME/.config/containers/auth.json must be searched too."""
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg_dir = tmp_path / ".config" / "containers"
+    cfg_dir.mkdir(parents=True)
+    raw = base64.b64encode(b"pod:man").decode()
+    (cfg_dir / "auth.json").write_text(
+        json.dumps({"auths": {"registry.example.com": {"auth": raw}}})
+    )
+    assert oci_auth_header("registry.example.com") == {"Authorization": f"Basic {raw}"}
+
+
+def test_oci_auth_header_logs_anonymous_when_no_creds(monkeypatch, tmp_path, caplog):
+    """When no source matches, a WARNING surfaces — silent anonymous fallback hides 401s."""
+    import logging
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    with caplog.at_level(logging.WARNING, logger="oci_modelcar.http"):
+        assert oci_auth_header("registry.example.com") == {}
+    assert any(
+        "anonymous" in r.getMessage().lower() or "no oci" in r.getMessage().lower()
+        for r in caplog.records
+    ), f"expected anonymous-fallback warning, got {[r.getMessage() for r in caplog.records]}"
+
+
+def test_oci_auth_header_logs_resolution_source(monkeypatch, tmp_path, caplog):
+    import logging
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg_dir = tmp_path / ".docker"
+    cfg_dir.mkdir()
+    raw = base64.b64encode(b"x:y").decode()
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"auths": {"registry.example.com": {"auth": raw}}})
+    )
+    with caplog.at_level(logging.INFO, logger="oci_modelcar.http"):
+        oci_auth_header("registry.example.com")
+    assert any("config.json" in r.getMessage() for r in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
+
+
 def test_smart_retry_raises_immediately_on_ssl_error():
     """SSL errors must NOT be retried — they never recover from a CA misconfig.
     increment() must surface the original exception so urllib3 stops retrying."""

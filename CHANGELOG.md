@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Auth-source visibility.** `oci_auth_header` now logs an `INFO` line on
+  successful resolution (`OCI auth resolved from <env|path>`) and a
+  `WARNING` when no source matches and the push falls back to anonymous,
+  so the user no longer needs to guess why their credentials weren't
+  picked up.
+- `$XDG_CONFIG_HOME/containers/auth.json` (default
+  `$HOME/.config/containers/auth.json`) is now part of the auth.json
+  search path, in addition to `~/.docker/config.json` and
+  `$XDG_RUNTIME_DIR/containers/auth.json`. This is the default location
+  for rootful `podman login` on most distros.
 - **Live per-file upload progress** during `push`. Each tracked file emits
   a `<path>: NN% (<transferred> / <total>)` line at most once every 5 s
   while its layer streams, with GB/MB/KB scaling. The cumulative byte
@@ -25,6 +35,24 @@ All notable changes to this project will be documented in this file.
   progress is visible in both modes.
 
 ### Fixed
+- **No more silent hang on TLS / proxy misconfig.** Three retry layers were
+  quietly retrying SSL handshake and proxy errors (urllib3 session-level
+  `Retry`, `HfStream._next_chunk`, `ChunkedBlobUpload._patch_with_retry`).
+  With each layer compounding, a misconfigured CA on a self-signed registry
+  could keep the CLI silent for several minutes after `Pushing N layers`
+  before the real error surfaced. A new `_SmartRetry` subclass re-raises
+  `ssl.SSLError` / `urllib3.exceptions.SSLError` / `urllib3.exceptions.ProxyError`
+  out of `Retry.increment()`, and the chunk-level retry loops re-raise
+  `requests.exceptions.SSLError` / `ProxyError` before falling into the
+  transient catch. Other transport errors still retry as before.
+- **`auth.json` keys with a repo path now match.** When the user has
+  `auths["artifactory.example/myproject"]` (set by `podman login
+  artifactory.example/myproject`), the previous strict `auths.get(host)`
+  lookup never matched, leading to silent anonymous push and a confusing
+  401 later. `docker_config_auth` now does longest-prefix match across
+  normalized auths keys (strips `https://`/`http://`, `/v2/` suffix,
+  trailing slashes), and `oci_auth_header` is plumbed `target_repo` from
+  `OciClient` so the lookup can use the full `host/repo` reference.
 - **Ctrl+C is now responsive in multi-worker mode.** Previously the
   `with ThreadPoolExecutor(...)` context manager called
   `pool.shutdown(wait=True)` on the way out of a `KeyboardInterrupt`,
