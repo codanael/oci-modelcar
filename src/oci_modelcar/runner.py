@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ def process_one_file(
     oci_max_retries: int = 10,
     backoff_initial: float = 1.0,
     progress_cb: Callable[[int], None] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> tuple[BlobDescriptor, str]:
     """Stream one HF file as one tar layer; returns (descriptor, diff_id).
 
@@ -55,6 +57,7 @@ def process_one_file(
         max_retries=hf_max_retries,
         backoff_initial=backoff_initial,
         progress_cb=progress_cb,
+        stop_event=stop_event,
     )
     upload = ChunkedBlobUpload(
         client=oci_client,
@@ -62,6 +65,7 @@ def process_one_file(
         chunk_size=chunk_size,
         max_retries=oci_max_retries,
         backoff_initial=backoff_initial,
+        stop_event=stop_event,
     )
     try:
         stream_layer_to(
@@ -164,6 +168,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
     skipped = 0
     pushed = 0
     failed: list[str] = []
+    stop_event = threading.Event()
 
     def task_for_file(idx: int, hf_file: HfFile) -> tuple[int, BlobDescriptor, str, bool]:
         cached = state.get_pushed(job_key, hf_file.path)
@@ -201,6 +206,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
             hf_max_retries=cfg.hf_max_retries,
             oci_max_retries=cfg.oci_max_retries,
             progress_cb=emitter.update,
+            stop_event=stop_event,
         )
         state.mark_pushed(
             job_key,
@@ -259,6 +265,7 @@ def run_push(cfg: Config, plog: PipelineLogger) -> RunResult:
                         raise
         except KeyboardInterrupt:
             plog.warning("Interrupted; cancelling pending uploads")
+            stop_event.set()
             for other in future_to_path:
                 other.cancel()
             raise

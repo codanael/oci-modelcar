@@ -21,19 +21,9 @@ def _patch_pipeline(monkeypatch: pytest.MonkeyPatch, files: list[HfFile]) -> Non
     monkeypatch.setattr(HfClient, "resolve_revision", lambda self, rev: _SHA)
     monkeypatch.setattr(HfClient, "list_files", lambda self, rev, allow: list(files))
 
-    def fake_process_one_file(
-        hf_client,
-        oci_client,
-        repo,
-        revision,
-        hf_file,
-        layer_prefix,
-        chunk_size,
-        hf_max_retries=10,
-        oci_max_retries=10,
-        backoff_initial=1.0,
-        progress_cb=None,
-    ):  # type: ignore[no-untyped-def]
+    def fake_process_one_file(*args, **kwargs):  # type: ignore[no-untyped-def]
+        hf_file = kwargs["hf_file"]
+        progress_cb = kwargs.get("progress_cb")
         if progress_cb is not None:
             progress_cb(hf_file.size // 2)
             progress_cb(hf_file.size)
@@ -111,6 +101,52 @@ def test_multi_worker_emits_intra_file_progress(
     assert "big.bin: 50%" in out
     assert "big.bin: 100%" in out
     assert "1.00 GB / 2.00 GB" in out
+
+
+def test_keyboard_interrupt_sets_stop_event_and_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the main thread takes a KeyboardInterrupt during as_completed,
+    run_push sets the shared stop_event so in-flight workers can short-circuit,
+    and re-raises so the CLI handler exits 130."""
+    files = [HfFile(path=f"f{i}.bin", size=100) for i in range(4)]
+    monkeypatch.setattr(HfClient, "resolve_revision", lambda self, rev: _SHA)
+    monkeypatch.setattr(HfClient, "list_files", lambda self, rev, allow: list(files))
+
+    seen_stop_events: list[object] = []
+
+    def fake_process_one_file(*args, **kwargs):  # type: ignore[no-untyped-def]
+        seen_stop_events.append(kwargs.get("stop_event"))
+        digest = "sha256:" + "0" * 64
+        return BlobDescriptor(media_type=ML_TAR, digest=digest, size=100), digest
+
+    monkeypatch.setattr(runner, "process_one_file", fake_process_one_file)
+    monkeypatch.setattr(runner, "push_small_blob", lambda *a, **kw: "sha256:" + "c" * 64)
+    monkeypatch.setattr(runner, "push_manifest", lambda *a, **kw: "sha256:" + "d" * 64)
+    monkeypatch.setattr(runner, "head_blob", lambda *a, **kw: {"digest": "x", "size": 0})
+    monkeypatch.setattr(runner, "validate_manifest_tag", lambda *a, **kw: None)
+
+    # Force KeyboardInterrupt the first time as_completed is iterated.
+    def fake_as_completed(futs):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner, "as_completed", fake_as_completed)
+
+    cfg = Config(
+        hf_repo="foo/bar",
+        registry="http://reg.example.com",
+        target_repo="m/x",
+        hf_revision=_SHA,
+        state_file=tmp_path / "state.json",
+        workers=4,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _run(cfg)
+
+    # Workers received a non-None stop_event, and after KeyboardInterrupt it is set.
+    non_none = [s for s in seen_stop_events if s is not None]
+    assert non_none, "no worker received a stop_event"
+    assert all(s.is_set() for s in non_none), "stop_event not set after KeyboardInterrupt"
 
 
 def test_mono_worker_emits_per_file_header_and_result(

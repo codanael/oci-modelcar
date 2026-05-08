@@ -105,6 +105,29 @@ def test_hfstream_progress_cb_optional(httpserver: HTTPServer):
     assert stream.read(-1) == payload
 
 
+def test_hfstream_aborts_when_stop_event_is_set(httpserver: HTTPServer):
+    """If stop_event is already set, HfStream raises InterruptedError on next read."""
+    import threading
+
+    payload = b"X" * 4096
+    httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
+        payload, headers={"Content-Length": str(len(payload))}
+    )
+    client = _make_client(httpserver)
+    stop = threading.Event()
+    stream = HfStream(
+        client,
+        revision="main",
+        path="file.bin",
+        size=len(payload),
+        chunk_size=1024,
+        stop_event=stop,
+    )
+    stop.set()
+    with pytest.raises(InterruptedError):
+        stream.read(-1)
+
+
 def test_hfstream_size_mismatch_raises(httpserver: HTTPServer):
     httpserver.expect_request("/foo/bar/resolve/main/file.bin").respond_with_data(
         b"X" * 100, headers={"Content-Length": "100"}

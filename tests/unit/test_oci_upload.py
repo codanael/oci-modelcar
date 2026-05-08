@@ -11,6 +11,23 @@ def _client(httpserver: HTTPServer) -> OciClient:
     return OciClient(host_url=httpserver.url_for(""))
 
 
+def test_chunked_upload_aborts_when_stop_event_is_set(httpserver: HTTPServer):
+    """If stop_event is set before a flush, write raises InterruptedError."""
+    import threading
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
+        "", status=202, headers={"Location": httpserver.url_for("/upload/abort")}
+    )
+    client = _client(httpserver)
+    stop = threading.Event()
+    upload = ChunkedBlobUpload(client, repo="repo", chunk_size=1024, stop_event=stop)
+    stop.set()
+    import pytest as _pytest
+
+    with _pytest.raises(InterruptedError):
+        upload.write(b"X" * 2048)  # forces _flush, which checks stop_event
+
+
 def test_chunked_upload_happy_path(httpserver: HTTPServer):
     payload = b"X" * (8 * 1024 * 1024 + 100)  # > 1 chunk
     expected_digest = "sha256:" + hashlib.sha256(payload).hexdigest()

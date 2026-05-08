@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+import threading
 import time
 from dataclasses import dataclass
 
@@ -88,6 +89,7 @@ class ChunkedBlobUpload:
         max_retries: int = 10,
         backoff_initial: float = 1.0,
         backoff_cap: float = 60.0,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.client = client
         self.repo = repo
@@ -95,6 +97,7 @@ class ChunkedBlobUpload:
         self.max_retries = max_retries
         self.backoff_initial = backoff_initial
         self.backoff_cap = backoff_cap
+        self.stop_event = stop_event
         self.h = hashlib.sha256()
         self.buf = bytearray()
         self.server_offset = 0
@@ -127,6 +130,10 @@ class ChunkedBlobUpload:
         self._patch_with_retry(chunk)
 
     def _patch_with_retry(self, chunk: bytes) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError(
+                f"OCI upload to {self.repo} aborted by stop_event at offset {self.server_offset}"
+            )
         start = self.server_offset
         end = start + len(chunk) - 1
         for attempt in range(self.max_retries):
