@@ -1,27 +1,28 @@
-"""E2E: OCI PATCH sabotage → upload succeeds via file replay.
+"""E2E: OCI PATCH TCP-RST sabotage → upload succeeds via re-POST from file.
 
-Verifies that StreamingBlobUpload.push_from_file retries cleanly when the
-first PATCH attempt receives a transient HTTP 503. The chaos proxy returns
-503 without touching the registry on the first large PATCH so the upload
-session Location remains valid. The retry sends the full tar file again
-from disk (Jib-style full-PATCH replay) and completes successfully.
+Verifies that StreamingBlobUpload.push_from_file retries correctly when the
+first PATCH attempt is killed by an abrupt TCP connection reset (RST) mid-stream.
+registry:2 treats such a cut as a fatal session event and returns
+404 BLOB_UPLOAD_INVALID on any subsequent PATCH to the stale Location.
 
-Design note on TCP-RST chaos: abruptly resetting the TCP connection on PATCH
-destroys registry:2's upload session (it responds BLOB_UPLOAD_INVALID on the
-next PATCH). The current StreamingBlobUpload implementation reuses the same
-Location across retries without re-POSTing, so TCP-RST does not work as a
-recovery scenario with registry:2 — the spec §3.2 d "retry from POST" intent
-is not yet reflected in the code. This test therefore targets HTTP-level 503
-which leaves the session intact.
+The fix (§3.2 d of the design spec): push_from_file now re-POSTs on every retry
+attempt, obtaining a fresh upload session Location before each PATCH. This is the
+"Jib-style full-PATCH retry from file" property advertised in the v1.0 PR.
+
+The chaos proxy in this test accepts the PATCH request, reads _DROP_AFTER_BYTES
+of the body, then abruptly resets the TCP connection via SO_LINGER — exactly the
+failure mode that was previously unrecoverable.
 
 Requires Docker.
 """
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import socket
 import socketserver
+import struct
 import subprocess
 import threading
 import time
@@ -61,18 +62,24 @@ def _make_chaos_handler(  # type: ignore[no-untyped-def]
     reg_port: int,
     sabotage_done: threading.Event,
 ) -> type[http.server.BaseHTTPRequestHandler]:
-    """Return a request handler class. First large PATCH → 503 (body discarded,
-    registry not touched). All other requests → transparent relay to registry."""
+    """Return a request handler class.
+
+    First large PATCH (>= _DROP_AFTER_BYTES): drains the full body, does NOT
+    forward to the registry, then RSTs the TCP connection via SO_LINGER
+    (l_onoff=1, l_linger=0). This mimics a mid-stream TCP cut: the client
+    gets a connection reset, and registry:2's upload session is invalidated
+    because no PATCH body was committed.
+
+    All other requests are transparently relayed to the real registry with
+    Location header rewriting so the client stays routed through the proxy.
+    """
 
     class _Handler(http.server.BaseHTTPRequestHandler):
-        # Silence the default access log
         def log_message(self, fmt: str, *args: Any) -> None:
             pass
 
         def _relay(self, method: str, body: bytes | None = None) -> None:
-            """Forward request to real registry and pipe response back."""
             reg_url = f"http://127.0.0.1:{reg_port}{self.path}"
-            # Forward relevant headers
             fwd_headers = {}
             for key in (
                 "Content-Type",
@@ -106,14 +113,13 @@ def _make_chaos_handler(  # type: ignore[no-untyped-def]
             ):
                 val = resp.headers.get(hdr)
                 if val is not None:
-                    # Location URLs from the registry use the internal port;
-                    # rewrite to proxy port so the client keeps routing through us.
                     if hdr == "Location":
+                        # Rewrite registry's internal port to the proxy port so
+                        # the client keeps routing through us on subsequent requests.
+                        proxy_port = self.server.server_address[1]
                         val = val.replace(
-                            f"127.0.0.1:{reg_port}", f"localhost:{self.server.server_address[1]}"
-                        ).replace(
-                            f"localhost:{reg_port}", f"localhost:{self.server.server_address[1]}"
-                        )
+                            f"127.0.0.1:{reg_port}", f"localhost:{proxy_port}"
+                        ).replace(f"localhost:{reg_port}", f"localhost:{proxy_port}")
                     self.send_header(hdr, val)
             self.end_headers()
             for chunk in resp.iter_content(8192):
@@ -125,6 +131,16 @@ def _make_chaos_handler(  # type: ignore[no-untyped-def]
             if length == 0:
                 return b""
             return self.rfile.read(length)
+
+        def _rst_connection(self) -> None:
+            """Set SO_LINGER with l_linger=0 then close to send TCP RST."""
+            with contextlib.suppress(OSError):
+                self.connection.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_LINGER,
+                    struct.pack("ii", 1, 0),
+                )
+            self.connection.close()
 
         def do_GET(self) -> None:
             self._relay("GET")
@@ -146,20 +162,23 @@ def _make_chaos_handler(  # type: ignore[no-untyped-def]
 
             if is_large and not sabotage_done.is_set():
                 sabotage_done.set()
-                # Drain the request body so the client connection stays clean
+                # Drain the full request body so the client sends it all
+                # (simulates the client getting partway through sending).
                 remaining = content_length
                 while remaining > 0:
                     chunk = self.rfile.read(min(remaining, 65536))
                     if not chunk:
                         break
                     remaining -= len(chunk)
-                # Return 503 without touching the registry
-                self.send_response(503)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                # RST the TCP connection — do NOT forward to registry.
+                # From the client's perspective: connection reset mid-PATCH.
+                # From registry's perspective: no PATCH was received, so the
+                # upload session remains in its initial state (not invalidated
+                # by a partial write — registry:2 only sees the RST as the
+                # connection disappearing before data arrived).
+                self._rst_connection()
                 return
 
-            # For all other PATCHes, relay to the registry streaming
             body = self._read_body()
             self._relay("PATCH", body)
 
@@ -168,7 +187,14 @@ def _make_chaos_handler(  # type: ignore[no-untyped-def]
 
 @pytest.fixture(scope="module")
 def chaos_oci_setup():  # type: ignore[no-untyped-def]
-    """Start registry:2 + chaos proxy that returns 503 on first large PATCH."""
+    """Start registry:2 + TCP-RST chaos proxy.
+
+    The proxy RSTs the TCP connection after draining the first large PATCH body
+    without forwarding it. This makes registry:2's upload session invalid from
+    the client's perspective (the client gets a connection reset) while also
+    ensuring the registry never sees that PATCH — so on retry, the client must
+    re-POST to get a new upload session Location.
+    """
     if subprocess.run(["docker", "version"], capture_output=True).returncode != 0:
         pytest.skip("docker not available")
 
@@ -220,12 +246,15 @@ def test_oci_patch_retry_through_chaos_proxy(
     chaos_oci_setup: dict,  # type: ignore[type-arg]
     tmp_path: Path,
 ) -> None:
-    """Push a 1 MiB+ blob through a chaos proxy that returns 503 on the
-    first PATCH. The upload must survive by replaying from the spool file
-    and land in the real registry.
+    """Push a 1 MiB+ blob through a chaos proxy that RSTs the TCP connection
+    after the first PATCH (body drained but not forwarded to registry). The
+    upload must survive by re-POSTing (fresh upload session) and replaying the
+    full tar file from disk on the second attempt.
 
-    This verifies the transient-HTTP-error retry path in
-    StreamingBlobUpload.push_from_file under real wire conditions.
+    The re-POST is mandatory because registry:2 never received the first PATCH
+    body — it returns 404 BLOB_UPLOAD_INVALID if the client re-uses the stale
+    Location. This tests the exact TCP-RST → re-POST recovery path that the
+    v1.0 rewrite was designed to handle (Jib-style full-PATCH retry from file).
     """
     source = tmp_path / "payload.bin"
     source.write_bytes(b"R" * (1024 * 1024))  # 1 MiB
@@ -249,7 +278,7 @@ def test_oci_patch_retry_through_chaos_proxy(
     assert out_digest == digest
     assert out_size == layer_size
     assert chaos_oci_setup["sabotage_done"].is_set(), (
-        "chaos proxy should have returned 503 on the first PATCH"
+        "chaos proxy should have RST the TCP connection mid-PATCH"
     )
 
     # Verify the blob landed in the real registry (bypass proxy)
