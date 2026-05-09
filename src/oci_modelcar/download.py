@@ -71,7 +71,15 @@ class HfDownloader:
 
     def resolve_revision(self, repo: str, revision: str) -> str:
         info = self.api.repo_info(repo, revision=revision)
-        return str(info.sha)
+        # ModelInfo.sha is `str | None` per huggingface_hub typings — the
+        # backend may legitimately omit it. Guard against silently passing
+        # the literal string "None" downstream into resolve URLs.
+        if info.sha is None:
+            raise RevisionNotFoundError(
+                f"HF returned no SHA for {repo}@{revision}",
+                hint="check that the revision exists and the API endpoint responds",
+            )
+        return info.sha
 
     def list_files(self, repo: str, revision: str, allow: tuple[str, ...]) -> list[HfFile]:
         out: list[HfFile] = []

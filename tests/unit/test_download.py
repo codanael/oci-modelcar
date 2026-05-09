@@ -42,13 +42,33 @@ def test_hf_file_no_lfs():
 
 
 def test_resolve_revision_uses_repo_info():
+    from huggingface_hub.hf_api import ModelInfo
+
     api = MagicMock()
-    api.repo_info.return_value = MagicMock(sha="9fb191250dd56d0ba7ec9785a025ed29c03d5998")
+    info = MagicMock(spec=ModelInfo)
+    info.sha = "9fb191250dd56d0ba7ec9785a025ed29c03d5998"
+    api.repo_info.return_value = info
     d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
     assert (
         d.resolve_revision("Qwen/Qwen2.5-7B", "main") == "9fb191250dd56d0ba7ec9785a025ed29c03d5998"
     )
     api.repo_info.assert_called_once_with("Qwen/Qwen2.5-7B", revision="main")
+
+
+def test_resolve_revision_raises_when_sha_is_none():
+    """ModelInfo.sha is `str | None` — guard against silently emitting the
+    literal "None" downstream into resolve URLs."""
+    from huggingface_hub.hf_api import ModelInfo
+
+    from oci_modelcar.errors import RevisionNotFoundError
+
+    api = MagicMock()
+    info = MagicMock(spec=ModelInfo)
+    info.sha = None
+    api.repo_info.return_value = info
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+    with pytest.raises(RevisionNotFoundError, match="no SHA"):
+        d.resolve_revision("Qwen/Qwen2.5-7B", "main")
 
 
 def _file_mock(path: str, size: int, lfs=None):
