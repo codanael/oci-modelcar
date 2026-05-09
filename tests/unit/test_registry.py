@@ -395,3 +395,53 @@ def test_streaming_retries_on_5xx(httpserver, tmp_path, monkeypatch):
     out_digest, _ = upload.push_from_file(f, len(payload), digest)
     assert out_digest == digest
     assert calls["n"] == 2
+
+
+def test_streaming_re_posts_init_on_each_retry(httpserver, tmp_path, monkeypatch):
+    """v1.0 invariant: each retry attempt starts with a fresh POST init,
+    so a TCP cut that invalidates the previous upload session is recovered
+    by getting a new Location."""
+    payload = b"P" * 256
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    f = tmp_path / "layer.tar"
+    f.write_bytes(payload)
+
+    post_calls: dict[str, int] = {"n": 0}
+
+    def post_handler(request):  # type: ignore[no-untyped-def]
+        post_calls["n"] += 1
+        loc = httpserver.url_for(f"/u/{post_calls['n']}")
+        return Response("", status=202, headers={"Location": loc})
+
+    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_handler(
+        post_handler
+    )
+
+    # First Location's PATCH "fails" (session invalidated by TCP cut).
+    # Second Location's PATCH succeeds.
+    patch_calls: dict[str, int] = {"n": 0}
+
+    def patch_handler(request):  # type: ignore[no-untyped-def]
+        patch_calls["n"] += 1
+        loc_path = request.path
+        if loc_path == "/u/1":
+            # Simulate BLOB_UPLOAD_INVALID from registry after TCP-level cut
+            return Response(
+                '{"errors":[{"code":"BLOB_UPLOAD_INVALID"}]}',
+                status=404,
+                content_type="application/json",
+            )
+        return Response("", status=202, headers={"Location": httpserver.url_for(loc_path)})
+
+    httpserver.expect_request("/u/1", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/u/2", method="PATCH").respond_with_handler(patch_handler)
+    httpserver.expect_request("/u/2", method="PUT").respond_with_data("", status=201)
+
+    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
+    upload = StreamingBlobUpload(
+        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+    )
+    out_digest, _ = upload.push_from_file(f, len(payload), digest)
+    assert out_digest == digest
+    assert post_calls["n"] >= 2, "must re-POST on each retry attempt"
+    assert patch_calls["n"] == 2, "first PATCH 404, second succeeds"

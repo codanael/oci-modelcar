@@ -164,8 +164,8 @@ class StreamingBlobUpload:
         """
         if self.stop_event is not None and self.stop_event.is_set():
             raise InterruptedError(f"OCI upload to {self.repo} aborted before start")
-        location = self._begin()
         last_exc: BaseException | None = None
+        location: str | None = None
 
         success = False
         for attempt in range(self.max_retries):
@@ -176,6 +176,12 @@ class StreamingBlobUpload:
             if attempt > 0:
                 self._sleep_backoff(attempt - 1)
             try:
+                # Always re-POST: a mid-stream TCP cut invalidates the registry's
+                # upload session, so retrying against the previous Location returns
+                # 404 BLOB_UPLOAD_INVALID. Fresh session per attempt matches Jib +
+                # containers/image behavior; cost is one POST round-trip per retry,
+                # which is negligible compared to the file body re-upload.
+                location = self._begin()
                 with open(tar_path, "rb") as body:
                     hdr = {
                         **self.client.auth,
@@ -190,7 +196,7 @@ class StreamingBlobUpload:
                     location = r.headers.get("Location", location)
                     success = True
                     break
-                if r.status_code in (408, 429) or 500 <= r.status_code < 600:
+                if r.status_code in (404, 408, 429) or 500 <= r.status_code < 600:
                     log.warning(
                         "PATCH transient %d for %s attempt %d/%d",
                         r.status_code,
@@ -235,6 +241,7 @@ class StreamingBlobUpload:
                 hint=f"--oci-max-retries N (currently {self.max_retries}), or check registry health.",
             )
 
+        assert location is not None  # success=True guarantees _begin() set it
         sep = "&" if "?" in location else "?"
         url = f"{location}{sep}digest={digest}"
         rp = self.client.session.put(url, headers=self.client.auth, timeout=120)
