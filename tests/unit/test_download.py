@@ -51,14 +51,33 @@ def test_resolve_revision_uses_repo_info():
     api.repo_info.assert_called_once_with("Qwen/Qwen2.5-7B", revision="main")
 
 
+def _file_mock(path: str, size: int, lfs=None):
+    """RepoFile-shaped mock that passes isinstance(entry, RepoFile)."""
+    from huggingface_hub.hf_api import RepoFile
+
+    m = MagicMock(spec=RepoFile)
+    m.path = path
+    m.size = size
+    m.lfs = lfs
+    return m
+
+
+def _folder_mock(path: str):
+    from huggingface_hub.hf_api import RepoFolder
+
+    m = MagicMock(spec=RepoFolder)
+    m.path = path
+    return m
+
+
 def test_list_files_filters_by_allow_patterns():
     api = MagicMock()
     api.list_repo_tree.return_value = [
-        MagicMock(type="file", path="model.safetensors", size=1000, lfs=MagicMock(sha256="a" * 64)),
-        MagicMock(type="file", path="config.json", size=100, lfs=None),
-        MagicMock(type="file", path="readme.md", size=50, lfs=None),
-        MagicMock(type="file", path="ignored.bin", size=10, lfs=None),
-        MagicMock(type="directory", path="subdir", size=0, lfs=None),
+        _file_mock("model.safetensors", 1000, lfs=MagicMock(sha256="a" * 64)),
+        _file_mock("config.json", 100),
+        _file_mock("readme.md", 50),
+        _file_mock("ignored.bin", 10),
+        _folder_mock("subdir"),
     ]
     d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
     files = d.list_files("Qwen/Qwen2.5-7B", "main", allow=(".safetensors", ".json", ".md"))
@@ -75,8 +94,8 @@ def test_list_files_extracts_lfs_sha256():
     api = MagicMock()
     lfs_meta = MagicMock(sha256="b" * 64)
     api.list_repo_tree.return_value = [
-        MagicMock(type="file", path="model.safetensors", size=1000, lfs=lfs_meta),
-        MagicMock(type="file", path="config.json", size=100, lfs=None),
+        _file_mock("model.safetensors", 1000, lfs=lfs_meta),
+        _file_mock("config.json", 100, lfs=None),
     ]
     d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
     files = d.list_files("Qwen/Qwen2.5-7B", "main", allow=(".safetensors", ".json"))

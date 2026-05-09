@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import requests
 import urllib3.exceptions
@@ -76,9 +76,13 @@ class HfDownloader:
     def list_files(self, repo: str, revision: str, allow: tuple[str, ...]) -> list[HfFile]:
         out: list[HfFile] = []
         for _entry in self.api.list_repo_tree(repo, revision=revision, recursive=True):
-            if getattr(_entry, "type", None) != "file":
+            # Narrow to files. huggingface_hub yields RepoFile/RepoFolder; the
+            # canonical discriminant is isinstance(RepoFile) — RepoFolder has
+            # no `.size`/`.lfs`. Tests use MagicMock(spec=RepoFile) so
+            # isinstance succeeds there too.
+            if not isinstance(_entry, RepoFile):
                 continue
-            entry = cast(RepoFile, _entry)
+            entry = _entry
             if not any(entry.path.endswith(ext) for ext in allow):
                 continue
             lfs = entry.lfs
