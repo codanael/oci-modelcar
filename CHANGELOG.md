@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Top-level `oci-modelcar --help`/`-h` now prints usage to stdout and exits 0
+  instead of treating `--help` as an unknown sub-command (#10).
+
 ## [1.0.0] - 2026-05-08
 
 ### Added

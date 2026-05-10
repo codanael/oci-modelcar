@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = argv[1]
     rest = argv[2:]
 
+    if sub in ("-h", "--help"):
+        print("usage: oci-modelcar {push,status,validate} [options]")
+        print("Run 'oci-modelcar push --help' for sub-command flags.")
+        return 0
+
     if sub == "push":
         return _run_push(rest)
     if sub == "status":

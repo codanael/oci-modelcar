@@ -1,16 +1,42 @@
 from unittest.mock import MagicMock
 
+import pytest
+
 from oci_modelcar.cli import main
 
 
 def test_cli_no_args_shows_usage(capsys):
     rc = main(["oci-modelcar"])
-    assert rc != 0
+    out = capsys.readouterr()
+    assert rc == 1
+    assert "usage:" in out.err
+    assert out.out == ""
 
 
 def test_cli_unknown_subcommand(capsys):
     rc = main(["oci-modelcar", "nope"])
-    assert rc != 0
+    out = capsys.readouterr()
+    assert rc == 1
+    assert "unknown sub-command" in out.err
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_cli_top_level_help_exits_zero(flag, capsys):
+    rc = main(["oci-modelcar", flag])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "usage:" in out.out
+    assert "{push,status,validate}" in out.out
+    assert "push --help" in out.out
+    assert out.err == ""
+
+
+def test_cli_push_help_argparse(capsys):
+    rc = main(["oci-modelcar", "push", "--help"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "usage:" in out.out
+    assert "--hf-repo" in out.out
 
 
 def test_cli_push_dispatches_to_pipeline(monkeypatch):
