@@ -37,7 +37,7 @@ pip install oci-modelcar
 uv tool install oci-modelcar
 ```
 
-Requires Python 3.14+.
+Requires Python 3.11+.
 
 ## Quick start
 

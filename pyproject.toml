@@ -7,7 +7,7 @@ name = "oci-modelcar"
 version = "1.0.0"
 description = "Push HuggingFace models to OCI registries (v1: per-file pipeline, single-PATCH per blob)"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "codanael"}]
@@ -56,7 +56,7 @@ oci-modelcar = "oci_modelcar.cli:main"
 packages = ["src/oci_modelcar"]
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
 
@@ -65,7 +65,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.11"
 strict = true
 warn_return_any = true
 files = ["src/oci_modelcar"]

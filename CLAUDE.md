@@ -223,10 +223,10 @@ explaining why in the PR.
   `urllib3`, and `huggingface_hub`. Any new dep must be justified in the spec.
 - Don't `pip install` Rust-based or mypyc-compiled tools (ruff, mypy) on
   NixOS dev — use `pkgs.<tool>` in `shell.nix`.
-- Don't lower `requires-python` below 3.14 — the floor was a deliberate user
-  choice. If you need to lower it for compatibility, you'll also need to
-  audit Python 3.14-only syntax (the unparenthesized `except A, B:` clauses,
-  any future `Self` from `typing`, free-threaded primitives, etc.).
+- Don't raise `requires-python` above 3.11 without a concrete reason. The
+  v1.0 codebase only relies on `typing.Self` (3.11) and union/generic
+  builtins; no 3.12+ syntax is used. Verify any change with `mypy --strict`
+  on the lowest supported version. The CI matrix tests 3.11/3.12/3.13/3.14.
 - Don't bypass `RegistryClient` when constructing registry URLs. Always go
   through `RegistryClient.url(...)`.
 - Don't hardcode `HF_TOKEN` or `OCI_PASSWORD` anywhere. Auth resolution lives

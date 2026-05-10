@@ -71,7 +71,7 @@ uv tool install oci-modelcar
 pip install git+https://github.com/codanael/oci-modelcar@main
 ```
 
-Requires Python 3.14+. The runtime dependencies are `requests`,
+Requires Python 3.11+. The runtime dependencies are `requests`,
 `urllib3`, and `huggingface_hub` (used for metadata only).
 
 Verify:
@@ -414,7 +414,7 @@ jobs:
     steps:
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.11'
       - run: pip install oci-modelcar
       - name: Push
         env:
