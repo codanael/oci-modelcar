@@ -363,31 +363,54 @@ def test_download_404_on_resolve_raises_entry_not_found(tmp_path: Path) -> None:
         d.download("repo", "main", f)
 
 
-def test_download_lfs_sha_verified(httpserver: HTTPServer, tmp_path: Path) -> None:
+def _make_session_serving_payload(payload: bytes) -> MagicMock:
+    """Mock session that returns a 200 response yielding `payload` once
+    via iter_content. Bypasses the GitHub runner's pytest-httpserver
+    instability on small bodies (recv_into hang in http.client)."""
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.headers = {"Content-Length": str(len(payload))}
+    fake_response.raise_for_status.return_value = None
+    fake_response.iter_content.return_value = iter([payload])
+    fake_session = MagicMock()
+    fake_session.get.return_value = fake_response
+    return fake_session
+
+
+def test_download_lfs_sha_verified(tmp_path: Path) -> None:
+    """LFS sha256 from HF tree metadata is verified during download."""
     import hashlib
 
     payload = b"hello world"
     correct_sha = hashlib.sha256(payload).hexdigest()
-    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data(
-        payload, headers={"Content-Length": str(len(payload))}
+    api = MagicMock()
+    api.endpoint = "http://hf"
+    d = HfDownloader(
+        api=api,
+        session=_make_session_serving_payload(payload),
+        spool_dir=tmp_path,
+        stop_event=None,
+        max_retries=2,
+        backoff_initial=0.0,
     )
-    spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
     f = HfFile(path="file.bin", size=len(payload), lfs_sha256=correct_sha)
-
     result = d.download("repo", "main", f)
     assert result.read_bytes() == payload
 
 
-def test_download_lfs_sha_mismatch_raises(httpserver: HTTPServer, tmp_path: Path) -> None:
+def test_download_lfs_sha_mismatch_raises(tmp_path: Path) -> None:
     payload = b"hello world"
     wrong_sha = "0" * 64
-    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data(
-        payload, headers={"Content-Length": str(len(payload))}
+    api = MagicMock()
+    api.endpoint = "http://hf"
+    d = HfDownloader(
+        api=api,
+        session=_make_session_serving_payload(payload),
+        spool_dir=tmp_path,
+        stop_event=None,
+        max_retries=2,
+        backoff_initial=0.0,
     )
-    spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
     f = HfFile(path="file.bin", size=len(payload), lfs_sha256=wrong_sha)
-
     with pytest.raises(DownloadError, match="sha256 mismatch"):
         d.download("repo", "main", f)
