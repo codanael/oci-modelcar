@@ -136,8 +136,9 @@ def oci_auth_header(registry_host: str, target_repo: str | None = None) -> dict[
             return {"Authorization": f"Basic {auth}"}
 
     log.warning(
-        "no OCI credentials found for %s — pushing anonymously "
-        "(set OCI_USERNAME/OCI_PASSWORD or run `podman login`/`docker login`)",
+        "no OCI credentials found for %s — proceeding anonymously "
+        "(set OCI_USERNAME/OCI_PASSWORD or run `podman login`/`docker login`; "
+        "protected registries will return 401 on writes)",
         target,
     )
     return {}

@@ -7,6 +7,10 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Top-level `oci-modelcar --help`/`-h` now prints usage to stdout and exits 0
   instead of treating `--help` as an unknown sub-command (#10).
+- Reword the no-OCI-credentials warning so it makes sense for read-only
+  `status`/`validate` calls as well as `push`. Now says "proceeding
+  anonymously" and notes that protected registries return 401 on writes
+  (#12).
 
 ## [1.0.0] - 2026-05-08
 
