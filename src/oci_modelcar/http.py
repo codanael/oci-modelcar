@@ -1,4 +1,4 @@
-"""Shared HTTP session + auth resolution."""
+"""Shared requests.Session, auth resolution, redirect hooks."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import ssl
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3.exceptions
@@ -19,6 +20,11 @@ from oci_modelcar import __version__
 
 log = logging.getLogger(__name__)
 
+
+def _envbool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
     ssl.SSLError,
     urllib3.exceptions.SSLError,
@@ -27,22 +33,11 @@ _NEVER_RETRY_EXC: tuple[type[Exception], ...] = (
 
 
 def is_transient_ssl(exc: BaseException) -> bool:
-    """True if `exc` is an SSL error whose root cause is a mid-stream EOF
-    (the connection got cut after the handshake succeeded), as opposed to a
-    handshake-time misconfig (CA invalid, hostname mismatch, expired cert).
+    """True if `exc` is a mid-stream SSL EOF (recoverable via Range/replay).
 
-    Mid-stream EOFs happen on long transfers when an idle proxy or firewall
-    rotates or times out the TCP connection — fully recoverable via Range
-    resume / OCI session resync, so they must be retried like any other
-    transient cut. Public to the package: consumed by `HfStream._next_chunk`
-    and `ChunkedBlobUpload._patch_with_retry` to override the default
-    fatal-on-SSLError verdict for this specific case.
-
-    Walks both `__cause__` (explicit `raise ... from ...`) and `__context__`
-    (implicit re-raise inside an except block, the common urllib3/requests
-    wrapping pattern) to find the underlying `ssl.SSLEOFError`. Falls back
-    to a string match on the canonical SSL error message because some
-    wrappers re-raise without preserving the chain.
+    Walks both __cause__ and __context__ to find a wrapped SSLEOFError.
+    Falls back to message match because some wrappers don't preserve the
+    chain (urllib3 → requests roundtrip).
     """
     cur: BaseException | None = exc
     seen: set[int] = set()
@@ -57,13 +52,7 @@ def is_transient_ssl(exc: BaseException) -> bool:
 
 
 class _SmartRetry(Retry):
-    """Retry policy that surfaces non-recoverable errors immediately.
-
-    SSL handshake failures and proxy misconfig don't get better with retry —
-    silently looping on them just hides the real issue from the user. Any
-    error in `_NEVER_RETRY_EXC` re-raises out of `increment()` so urllib3
-    stops dead instead of burning the full backoff schedule.
-    """
+    """urllib3 Retry that re-raises SSL/Proxy errors instead of looping on them."""
 
     def increment(  # type: ignore[override]
         self,
@@ -79,45 +68,58 @@ class _SmartRetry(Retry):
         return super().increment(method, url, response, error, _pool, _stacktrace)
 
 
-def build_session() -> requests.Session:
-    """Session with retries on idempotent methods only.
+class _SafeSession(requests.Session):
+    """Session that strips Authorization on cross-origin redirects regardless
+    of whether the header was set per-request or via session.headers.
 
-    Non-idempotent methods (PATCH, PUT) are NOT retried automatically;
-    those have their own resync-aware retry logic in oci.py.
-    """
-    s = requests.Session()
-    retry = _SmartRetry(
-        total=8,
-        backoff_factor=2,
-        status_forcelist=[408, 429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "HEAD"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    s.headers["User-Agent"] = f"oci-modelcar/{__version__}"
-    return s
+    requests >=2.32 already strips session-level auth; this also handles
+    per-request Authorization headers, which is the common case for
+    HuggingFace LFS file pulls (HF redirects to signed S3/CloudFront URLs
+    that we must not give the Bearer token to)."""
+
+    def rebuild_auth(
+        self,
+        prepared_request: requests.PreparedRequest,
+        response: requests.Response,
+    ) -> None:
+        super().rebuild_auth(prepared_request, response)  # type: ignore[no-untyped-call]
+        if "Authorization" not in prepared_request.headers:
+            return
+        original_url = response.request.url
+        if original_url is None:
+            return
+        original_netloc = urlparse(original_url).netloc
+        new_netloc = urlparse(prepared_request.url or "").netloc
+        if new_netloc and new_netloc != original_netloc:
+            del prepared_request.headers["Authorization"]
 
 
-def oci_auth_header(
-    registry_host: str,
-    target_repo: str | None = None,
-) -> dict[str, str]:
-    """Resolve registry auth in priority order.
+def huggingface_token() -> str | None:
+    """Resolve HF token. Priority: HF_TOKEN > HUGGING_FACE_HUB_TOKEN > cache file.
+    Returns None if HF_HUB_DISABLE_IMPLICIT_TOKEN is set."""
+    if _envbool("HF_HUB_DISABLE_IMPLICIT_TOKEN"):
+        return None
+    for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        tok = os.environ.get(env_name)
+        if tok:
+            return tok
+    cache = Path.home() / ".cache" / "huggingface" / "token"
+    if cache.is_file():
+        try:
+            content = cache.read_text().strip()
+            return content or None
+        except OSError:
+            return None
+    return None
 
-    1. OCI_USERNAME + OCI_PASSWORD env
-    2. ~/.docker/config.json
-    3. $XDG_RUNTIME_DIR/containers/auth.json (rootless podman)
-    4. $XDG_CONFIG_HOME/containers/auth.json (default $HOME/.config/...)
 
-    When `target_repo` is provided, sources are queried with the full
-    `host/repo` path so that auths keyed at a sub-path (e.g.
-    `artifactory.example/myproject`) win via longest-prefix match.
+def huggingface_auth_header() -> dict[str, str]:
+    tok = huggingface_token()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
 
-    Logs a one-line INFO marker for the resolved source, or a WARNING when
-    no source matches and the push falls back to anonymous.
-    """
+
+def oci_auth_header(registry_host: str, target_repo: str | None = None) -> dict[str, str]:
+    """Resolve OCI registry auth: env > ~/.docker/config.json > podman auth.json."""
     target = f"{registry_host}/{target_repo}" if target_repo else registry_host
 
     user = os.environ.get("OCI_USERNAME")
@@ -128,21 +130,20 @@ def oci_auth_header(
         return {"Authorization": f"Basic {token}"}
 
     for path in _auth_search_paths():
-        auth = docker_config_auth(path, target)
+        auth = _docker_config_auth(path, target)
         if auth:
             log.info("OCI auth resolved from %s", path)
             return {"Authorization": f"Basic {auth}"}
 
     log.warning(
-        "no OCI credentials found for %s — pushing anonymously (set OCI_USERNAME/OCI_PASSWORD "
-        "or run `podman login`/`docker login`)",
+        "no OCI credentials found for %s — pushing anonymously "
+        "(set OCI_USERNAME/OCI_PASSWORD or run `podman login`/`docker login`)",
         target,
     )
     return {}
 
 
 def _auth_search_paths() -> list[Path]:
-    """Ordered list of auth.json paths to consult (most specific first)."""
     paths = [Path.home() / ".docker" / "config.json"]
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime:
@@ -154,7 +155,6 @@ def _auth_search_paths() -> list[Path]:
 
 
 def _normalize_auth_key(key: str) -> str:
-    """Strip http(s):// prefix, /v2/ trailing path, and trailing slashes."""
     for prefix in ("https://", "http://"):
         if key.startswith(prefix):
             key = key[len(prefix) :]
@@ -165,33 +165,21 @@ def _normalize_auth_key(key: str) -> str:
     return key
 
 
-def docker_config_auth(path: Path, target: str) -> str | None:
-    """Read a docker/podman config.json and return the base64 auth blob if any.
-
-    `target` may be a bare host or `host/repo`. Auths keys are normalized
-    (`https://`, `/v2/`, trailing `/` stripped) and the longest normalized
-    key that is a prefix of `target` wins.
-    """
+def _docker_config_auth(path: Path, target: str) -> str | None:
     if not path.is_file():
         return None
     try:
         data = json.loads(path.read_text())
-    except OSError:
-        return None
-    except json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return None
     auths = data.get("auths", {})
     if not isinstance(auths, dict):
         return None
-
-    best_key: str | None = None
-    best_len = -1
+    best_key, best_len = None, -1
     for raw_key in auths:
         norm = _normalize_auth_key(raw_key)
-        matches = norm == target or target.startswith(norm + "/")
-        if matches and len(norm) > best_len:
-            best_len = len(norm)
-            best_key = raw_key
+        if (norm == target or target.startswith(norm + "/")) and len(norm) > best_len:
+            best_key, best_len = raw_key, len(norm)
     if best_key is None:
         return None
     entry = auths[best_key]
@@ -201,20 +189,22 @@ def docker_config_auth(path: Path, target: str) -> str | None:
     return raw if isinstance(raw, str) and raw else None
 
 
-def huggingface_token() -> str | None:
-    """Resolve HF token: HF_TOKEN env > ~/.cache/huggingface/token."""
-    tok = os.environ.get("HF_TOKEN")
-    if tok:
-        return tok
-    cache = Path.home() / ".cache" / "huggingface" / "token"
-    if cache.is_file():
-        try:
-            return cache.read_text().strip() or None
-        except OSError:
-            return None
-    return None
-
-
-def huggingface_auth_header() -> dict[str, str]:
-    tok = huggingface_token()
-    return {"Authorization": f"Bearer {tok}"} if tok else {}
+def build_session() -> requests.Session:
+    """Single source of truth for HTTP sessions across the codebase."""
+    s = _SafeSession()
+    retry = _SmartRetry(
+        total=8,
+        backoff_factor=2,
+        status_forcelist=[408, 429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers["User-Agent"] = (
+        os.environ.get("OCI_MODELCAR_USER_AGENT") or f"oci-modelcar/{__version__}"
+    )
+    if _envbool("OCI_MODELCAR_FORCE_CONNECTION_CLOSE"):
+        s.headers["Connection"] = "close"
+    return s

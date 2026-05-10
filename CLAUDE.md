@@ -4,43 +4,55 @@ Guidance for AI assistants and future Claude sessions working on this repo.
 
 ## What this is
 
-`oci-modelcar` — a Python CLI that streams HuggingFace models directly into OCI
-registries as multi-layer images, suitable for KServe with native OCI image
-volumes (KEP-4639). Public package on PyPI, MIT licensed. Repo:
-`github.com/codanael/oci-modelcar`. Latest released: v0.1.0.
+`oci-modelcar` — a Python CLI that pushes HuggingFace models to OCI registries
+as multi-layer images, suitable for KServe with native OCI image volumes
+(KEP-4639). Public package on PyPI, MIT licensed. Repo:
+`github.com/codanael/oci-modelcar`. Latest released: v1.0.0.
 
 ## Read in this order
 
 1. `README.md` — user-facing overview, install, quick start, OCI compliance notes.
-2. `docs/superpowers/specs/2026-05-07-oci-modelcar-design.md` — the full design
-   spec with rationale for every choice. The single best file to read before
-   making any non-trivial change.
-3. `docs/superpowers/plans/2026-05-07-oci-modelcar-implementation.md` — the
-   26-task TDD plan that built v0.1.0. Use this as a template for future
-   feature plans.
-4. `CHANGELOG.md` — what's released, what's planned (search "v0.2 follow-up").
+2. `docs/superpowers/specs/2026-05-08-oci-modelcar-v1-design.md` — the full
+   v1.0 design spec with rationale for every choice. The single best file to
+   read before making any non-trivial change.
+3. `docs/superpowers/plans/2026-05-08-oci-modelcar-v1.md` — the 11-phase TDD
+   plan that built v1.0. Use this as a template for future feature plans.
+4. `CHANGELOG.md` — what's released, what changed from v0.x to v1.0.
 
 ## Architecture
 
+v1.0 uses a per-file pipeline: each HF file is downloaded to `--spool-dir`,
+wrapped in a tar layer, then pushed to the registry in a single PATCH per blob
+(Jib-style). On PATCH failure the full PATCH is replayed from the local spool
+file. The registry HEAD is the source of truth for resumability; no local state
+file is needed. `huggingface_hub.HfApi` handles metadata (revision resolve, file
+listing, LFS sha256 detection); bytes are streamed by our own code so mid-stream
+cancellation works on multi-GB downloads.
+
 ```
 src/oci_modelcar/
-├── __init__.py         version metadata
-├── __main__.py         python -m oci_modelcar entry
-├── cli.py              argparse dispatch on argv[0] for push/status/validate
-├── config.py           Config dataclass + ConfigError; env+CLI parsing, validation
-├── http.py             build_session(), oci_auth_header(), huggingface_token()
-├── logging.py          PipelineLogger, TextFormatter, AzureFormatter, FileScopedLogger
-├── hf.py               HfClient (resolve_revision, list_files), HfFile, HfStream (Range resume)
-├── oci.py              OciClient, BlobDescriptor, ChunkedBlobUpload, push_small_blob,
-│                       head_blob, push_manifest, validate_manifest_tag, _is_loopback
-├── tar_layer.py        make_tar_info, build_layer_tar_bytes, stream_layer_to
-├── manifest.py         build_config_bytes, build_manifest_bytes
-├── state.py            JsonStateStore (atomic JSON, threading.Lock), JobState, FileState
-├── runner.py           process_one_file, run_push, RunResult
-└── tags.py             derive_tag (40-char SHA -> [:12] or sanitized name)
+├── __init__.py     version metadata
+├── __main__.py     python -m oci_modelcar entry
+├── cli.py          argparse dispatch; push/status/validate sub-commands; exit codes
+├── config.py       Config dataclass + ConfigError; env+CLI parsing, validation
+├── errors.py       GatedRepoError, RevisionNotFoundError, EntryNotFoundError,
+│                   DiskSpaceError, PushError, PartialFailureError; exit code map
+├── http.py         _SafeSession (cross-origin Authorization stripping),
+│                   hf_session(), oci_session(), oci_auth_header(), hf_token()
+├── logging.py      PipelineLogger, TextFormatter, AzureFormatter
+├── download.py     HfDownloader (HfApi metadata + streamed bytes), atomic write,
+│                   Range-200 fallback
+├── layer.py        make_tar_info, build_layer_tar, tar_layer_size; TarLayerInfo
+├── manifest.py     build_config_bytes, build_manifest_bytes, derive_tag
+├── registry.py     RegistryClient, BlobDescriptor, SinglePatchUpload,
+│                   push_small_blob, head_blob, push_manifest, tag_conflict_policy,
+│                   _is_loopback
+└── pipeline.py     FileWorker (download→tar→push→cleanup), Pipeline (pre-flight,
+                    disk check, ThreadPoolExecutor, fail-fast, manifest assembly),
+                    RunResult
 ```
 
-Module dependency graph is acyclic. Wiring lives only in `runner.py` and
+Module dependency graph is acyclic. Wiring lives only in `pipeline.py` and
 `cli.py`. Each module is independently testable.
 
 ## Dev environment (NixOS)
@@ -106,42 +118,67 @@ explaining why in the PR.
   Preserves byte-identical config across runs → identical config digest →
   identical manifest digest. Adding `created` breaks idempotence.
 - **mtime=0, uid=gid=0, uname=gname=""** in all tar headers
-  (`tar_layer.py:make_tar_info`). Reproducibility.
-- **File-level resume across processes**, not chunk-level. `hashlib.sha256` is
-  not serializable cross-process and OCI upload sessions expire. Intra-process
-  retries handle network blips via Range (HF) and PATCH resync via GET (OCI).
+  (`layer.py:make_tar_info`). Reproducibility.
+- **Single PATCH per blob from local spool file (Jib-style replay-on-cut).**
+  `registry.py:SinglePatchUpload` issues one PATCH with upfront `Content-Length`.
+  On failure the full PATCH is replayed from the spool file. This eliminates
+  per-PATCH LB routing decisions on Artifactory HA clusters. Don't reintroduce
+  chunked mode without updating the spec.
 - **`Content-Range: N-M`** on PATCH (no `bytes ` prefix, both bounds inclusive).
   This is the OCI Distribution v1.1 format — distinct from RFC 7233.
-  `oci.py:_patch_with_retry` line emitting this is wire-spec critical.
-- **GET on upload session returns 204** with optional `Range: 0-N` header.
-  Header absent → 0 bytes received. Header `0-0` → 1 byte received.
-  `oci.py:_resync` handles all three cases.
+  `registry.py:SinglePatchUpload` line emitting this is wire-spec critical.
 - **Manifest layers ordered by alphabetical `hf_path`** regardless of worker
-  completion order (`runner.py:run_push` reconstructs from `layers_by_idx`).
+  completion order (`pipeline.py:Pipeline.run` reconstructs from `layers_by_idx`).
   This makes the manifest digest deterministic across `--workers` settings.
 - **Workers default 1, hard cap 8**. The proxy/HF bottleneck is reached around
-  N=4 in practice; larger N adds memory without throughput.
-- **Default HF endpoint is `https://huggingface.co`**. The original use case
-  was an Artifactory HF proxy, but the v0.1.0 release deliberately makes no
-  reference to any specific provider. Use `--hf-endpoint` to override.
+  N=4 in practice; larger N adds disk pressure and memory without throughput.
+- **Default HF endpoint is `https://huggingface.co`**. Use `--hf-endpoint` to
+  override (e.g. for an Artifactory HF proxy).
 - **Loopback registries (`localhost`, `127.x.x.x`, `::1`) auto-use HTTP**
-  (`oci.py:_is_loopback`). Remote = HTTPS. Override with explicit
+  (`registry.py:_is_loopback`). Remote = HTTPS. Override with explicit
   `http://`/`https://` prefix on `--registry`.
-- **CLI dispatches manually on `argv[0]`** (`cli.py:main`), then calls
-  `Config.from_env_and_args(argv[1:])` — `Config`'s parser is at top-level
-  (no `push` subparser). Don't reintroduce subparsers in `Config`; the split
-  is intentional.
+- **Cross-origin Authorization stripping in `_SafeSession`** (`http.py`).
+  HF Bearer tokens must NOT be forwarded on HF→S3/CloudFront redirects.
+  `_SafeSession.rebuild_auth` strips the Authorization header when origin
+  changes. Do not remove this guard.
+- **`huggingface_hub.HfApi` for metadata only; bytes via our streamer.**
+  `HfApi` is used for revision resolution and file listing (including LFS
+  sha256 detection). Download bytes go through our own `HfDownloader` so
+  mid-stream cancellation (via `threading.Event`) works on multi-GB files.
+  Do not replace the byte streaming with `hf_hub_download` — it can't be
+  cancelled mid-stream.
+- **Atomic write semantics for downloaded files** (`.partial` → rename).
+  `download.py:HfDownloader` writes to `<path>.partial` and renames on
+  completion. A partial file left on disk is automatically overwritten on
+  retry; a complete file is never re-downloaded if `--clean-hf-after-push`
+  is not set.
+- **`--clean-hf-after-push` is opt-in; default keeps source files.**
+  This allows re-running with `--force` without re-downloading. Set it in
+  space-constrained environments (containers with small ephemeral storage).
+- **`errors.py` exit codes 0..7** mapped to specific exception classes.
+  Exit code contract: 0=success, 1=partial failure, 2=usage/config error,
+  3=gated repo, 4=revision not found, 5=entry not found, 6=disk space,
+  7=push error. Don't renumber without updating `cli.py` and the spec.
+- **Registry HEAD is the source of truth for resumability.** No local state
+  file (`state.json` was removed in v1.0). Blobs already present in the
+  registry are detected via HEAD check and skipped. `--force` bypasses HEAD.
+- **CLI uses argparse sub-commands** (`push`, `status`, `validate`) dispatched
+  by `cli.py:main`. `Config` has its own parser scoped to `push` arguments.
+  Don't collapse sub-commands into `argv[0]` dispatch (reverted from v0.x).
+- **`derive_tag` lives in `manifest.py`** (migrated from the removed `tags.py`).
+  40-char SHA → first 12 chars; other revision strings are sanitized.
+  Don't split it out again.
 
 ## NixOS-specific gotchas
 
 - `pip install ruff` ships a glibc binary; `shell.nix` works around with
   nix-provided `pkgs.ruff`/`pkgs.mypy` taking PATH precedence.
 - `ruff format` on this Python-3.14-targeted codebase will normalize
-  `except (A, B):` to the unparenthesized `except A, B:` form. The two
-  occurrences (in `state.py` and `logging.py`) carry `# fmt: skip` to keep
-  parens for readability. **Don't remove the `# fmt: skip`** without first
-  running `ruff format` to confirm behavior — both forms are semantically
-  equivalent in Python 3.14+ but the parens form reads cleanly to humans.
+  `except (A, B):` to the unparenthesized `except A, B:` form. Any
+  occurrence carrying `# fmt: skip` keeps parens for readability.
+  **Don't remove `# fmt: skip`** without first running `ruff format` to
+  confirm behavior — both forms are semantically equivalent in Python
+  3.14+ but the parens form reads cleanly to humans.
 - Tests' pytest fixtures sometimes need `werkzeug.wrappers.Response` directly
   to set `Content-Length` headers that werkzeug would otherwise recompute.
   See `tests/unit/test_oci_misc.py` for the pattern.
@@ -167,12 +204,10 @@ explaining why in the PR.
 ## Test layout
 
 - `tests/unit/` — fast (sub-second) per-module tests with `pytest-httpserver`
-  mocks. The OCI compliance tests are the most spec-critical; don't let
-  them lose coverage.
-- `tests/integration/` — multi-module pipeline tests with mocked HTTP. Note
-  `tests/integration/test_runner_multi.py` currently has minimal coverage of
-  the parallel path — broader concurrency testing is a v0.2 follow-up
-  (cross-thread state writes contention, fail-fast cancellation timing).
+  mocks. The registry compliance tests are the most spec-critical; don't let
+  them lose coverage. ~149 tests across all v1 modules.
+- `tests/integration/` — multi-module pipeline tests with mocked HTTP.
+  Covers fail-fast cancellation timing and partial failure (continue-on-error).
 - `tests/e2e/` — real HuggingFace `hf-internal-testing/tiny-random-LlamaForCausalLM`
   pinned at SHA `9fb191250dd56d0ba7ec9785a025ed29c03d5998`, against a Docker
   `registry:2`. Marked `@pytest.mark.e2e`, gated. Update the pinned SHA only
@@ -184,36 +219,42 @@ explaining why in the PR.
 - Don't compress layers (gzip/zstd) without recomputing both digest AND diff_id.
 - Don't introduce mutable default factories on dataclasses without
   `field(default_factory=...)`.
-- Don't widen runtime dependencies casually. v0.1.0 ships with **only**
-  `requests` and `urllib3`. Any new dep must be justified in the design spec.
+- Don't widen runtime dependencies casually. v1.0 ships with `requests`,
+  `urllib3`, and `huggingface_hub`. Any new dep must be justified in the spec.
 - Don't `pip install` Rust-based or mypyc-compiled tools (ruff, mypy) on
   NixOS dev — use `pkgs.<tool>` in `shell.nix`.
-- Don't lower `requires-python` below 3.14 — the floor was a deliberate user
-  choice. If you need to lower it for compatibility, you'll also need to
-  audit Python 3.14-only syntax (the unparenthesized `except A, B:` clauses,
-  any future `Self` from `typing`, free-threaded primitives, etc.).
-- Don't bypass `OciClient` when constructing registry URLs (the `validate`
-  sub-command was previously broken because of this — fixed in commit
-  `688659b`). Always go through `OciClient.url(...)`.
+- Don't raise `requires-python` above 3.11 without a concrete reason. The
+  v1.0 codebase only relies on `typing.Self` (3.11) and union/generic
+  builtins; no 3.12+ syntax is used. Verify any change with `mypy --strict`
+  on the lowest supported version. The CI matrix tests 3.11/3.12/3.13/3.14.
+- Don't bypass `RegistryClient` when constructing registry URLs. Always go
+  through `RegistryClient.url(...)`.
 - Don't hardcode `HF_TOKEN` or `OCI_PASSWORD` anywhere. Auth resolution lives
   in `http.py`; extend it there if a new auth source is needed.
+- Don't remove the `_SafeSession.rebuild_auth` cross-origin Authorization
+  stripping — it prevents leaking Bearer tokens to S3/CloudFront.
+- Don't replace `HfDownloader` byte streaming with `hf_hub_download` — it
+  can't be cancelled mid-stream via `threading.Event`.
+- Don't reintroduce `state.json` or `JsonStateStore`. The registry HEAD is the
+  source of truth. If you need cross-run state, justify it in the spec first.
 - Don't commit `.venv/`, `shell.nix`, or `stream_modelcar.py` (the original
   prototype, kept locally for reference). All are in `.gitignore`.
 
 ## Common debugging tips
 
-- **Wire-format issues**: enable `--verbose` to log all OCI session
-  transitions (offset progression, location URL changes).
+- **Wire-format issues**: enable `--verbose` to log all OCI PATCH transitions
+  (upload location URL, retry counts, replay from spool).
 - **Reproducibility check**: run a push twice with `--force`. Manifest digest
   must be identical. If not, something has crept in (likely `created` field,
   or non-deterministic tar header).
-- **Resume issues**: inspect `~/.local/state/oci-modelcar/state.json`
-  (configurable via `--state-file`). Each job carries `files{}` with
-  `digest`, `diff_id`, and `layer_size`. The `layer_size` field was added in
-  v0.1.0 release fix — older state files may lack it; the runner re-pushes
-  affected files automatically.
-- **Network blips**: HF Range and OCI resync should mask single failures.
-  If retries exhaust, the file fails. Check warnings with `--verbose`.
+- **Disk space**: the spool directory grows by ~2× the largest layer per worker.
+  Use `--clean-hf-after-push` to reclaim space after each layer is pushed.
+  The pre-flight check will refuse to start if space is insufficient.
+- **Token issues**: set `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` to skip implicit
+  token sources and verify you're using the right `HF_TOKEN`.
+- **Network blips**: OCI PATCH is replayed from spool file on cut. If retries
+  exhaust (`--oci-max-retries`, default 5), the file fails.
+  Check warnings with `--verbose`.
 
 ## Useful commands
 
@@ -228,14 +269,18 @@ nix-shell ./shell.nix --command "oci-modelcar push \
   --registry localhost:5000 \
   --target-repo demo/qwen-05b"
 
+# Push with disk cleanup after each layer
+nix-shell ./shell.nix --command "oci-modelcar push \
+  --hf-repo Qwen/Qwen2.5-0.5B-Instruct \
+  --registry localhost:5000 \
+  --target-repo demo/qwen-05b \
+  --clean-hf-after-push"
+
 # Inspect what was pushed
 nix-shell ./shell.nix --command "skopeo --insecure-policy inspect --tls-verify=false docker://localhost:5000/demo/qwen-05b:<sha12>"
 
-# View state
-cat ~/.local/state/oci-modelcar/state.json | python3 -m json.tool
-
 # Find all TODOs and known limitations
-grep -rn -E "(TODO|FIXME|v0\.2)" src/ docs/
+grep -rn -E "(TODO|FIXME)" src/ docs/
 
 # Re-run the whole test suite
 nix-shell ./shell.nix --command "python3.14 -m pytest tests/ -v"
@@ -243,17 +288,18 @@ nix-shell ./shell.nix --command "python3.14 -m pytest tests/ -v"
 
 ## When stuck
 
-- The design spec has the rationale for every choice. Read it before second-
-  guessing a pattern in the code.
+- The design spec (`docs/superpowers/specs/2026-05-08-oci-modelcar-v1-design.md`)
+  has the rationale for every choice. Read it before second-guessing a pattern.
 - The OCI Distribution v1.1 and Image Spec v1.1 are the source of truth for
   wire format. URLs in `docs/superpowers/specs/...` reference the relevant
   sections.
-- The HF API surface in use:
-  - `GET /api/models/{repo}` → `{sha: ...}` for the default branch
-  - `GET /api/models/{repo}/revision/{rev}` → `{sha: ...}` for a specific revision
-  - `GET /api/models/{repo}/tree/{rev}?recursive=true` → list of files
-  - `GET /{repo}/resolve/{rev}/{path}` → file content (Range-supportable)
+- The HF surface in use:
+  - `huggingface_hub.HfApi.model_info()` → resolve revision SHA
+  - `huggingface_hub.HfApi.list_repo_tree()` → file listing with LFS sha256
+  - `GET /{repo}/resolve/{rev}/{path}` → file bytes (Range-supportable),
+    called directly by `download.py:HfDownloader` (not via HfApi, for
+    cancellation support)
 - For "is this Python 3.14 valid?" questions, parse with `ast.parse(...)` to
   see what the AST does. Some surprising syntactic forms are accepted.
 - For OCI behavior verification, `registry:2` is your friend — it implements
-  the full OCI Distribution spec including the resume semantics.
+  the full OCI Distribution spec including the PATCH-from-zero semantics.

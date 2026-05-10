@@ -2,7 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.0.0] - 2026-05-08
+
+### Added
+- Per-file pipeline (download → tar → push → cleanup) parallelized via `--workers`.
+- `huggingface_hub.HfApi` for metadata (revision resolve, file listing,
+  LFS sha256 detection); bytes streamed by our own code so mid-stream
+  cancellation works on multi-GB downloads.
+- Atomic write semantics for downloaded files (`.partial` → rename).
+- Cross-origin Authorization stripping on HF→S3 redirects (security).
+- Expanded HF token sources: `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+  `~/.cache/huggingface/token`, opt-out via `HF_HUB_DISABLE_IMPLICIT_TOKEN=1`.
+- Range-200 fallback (server ignores Range → truncate + restart) ported
+  from huggingface_hub.
+- Specific error classes: `GatedRepoError`, `RevisionNotFoundError`,
+  `EntryNotFoundError`, `DiskSpaceError`, `PushError`, `PartialFailureError`.
+- Per-class CI exit codes: 0/1/2/3/4/5/6/7.
+- `--spool-dir`, `--clean-hf-after-push` flags + matching env vars.
+- Tag conflict policy: skip on match, refuse without `--force`, overwrite
+  with `--force`.
+- Mode-aware disk space pre-flight check (with/without `--clean-hf-after-push`).
+
+### Changed
+- **Single PATCH per blob from local file (Jib-style replay-on-cut).**
+  Eliminates per-PATCH LB routing decisions on misconfigured Artifactory
+  HA clusters. Same wire shape as containers/image and Jib.
+- Default `--oci-max-retries` lowered from 10 to 5 (each retry is a full
+  PATCH replay; bandwidth ballooning on systematic failures otherwise).
+- Tar layer size formula now exposed as `layer.tar_layer_size(file_size)`.
+
+### Removed
+- `state.json` and the `state.py` module entirely. Registry HEAD is
+  the source of truth for resumability and idempotency.
+- `ChunkedBlobUpload` and chunked PATCH mode.
+- `--state-file`, `--chunk-mib`, `--upload-mode` flags. Use `--spool-dir`
+  and `--clean-hf-after-push` for the new disk model.
+- `_PipeBuffer` thread-bridge (per-file pipeline replaces it).
+- `tags.py` (`derive_tag` migrated into `manifest.py`).
+
+### Security
+- HF Authorization tokens are no longer forwarded on cross-origin
+  redirects. Previous versions could leak a Bearer token to S3 /
+  CloudFront (HF's redirect target for LFS files), where the request
+  was rejected but the token may have been logged.
 
 ## [0.5.0] - 2026-05-08
 

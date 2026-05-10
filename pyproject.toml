@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "oci-modelcar"
-version = "0.5.0"
-description = "Stream HuggingFace models directly into OCI registries as multi-layer images"
+version = "1.0.0"
+description = "Push HuggingFace models to OCI registries (v1: per-file pipeline, single-PATCH per blob)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "requests>=2.32",
     "urllib3>=2.2",
+    "huggingface_hub>=0.27",
 ]
 
 [project.urls]
@@ -40,6 +41,7 @@ dev = [
     "pytest>=8",
     "pytest-cov>=5",
     "pytest-httpserver>=1.0",
+    "pytest-timeout>=2.3",
     "ruff>=0.7",
     "mypy>=1.13",
     "types-requests>=2.32",
@@ -70,9 +72,12 @@ warn_return_any = true
 files = ["src/oci_modelcar"]
 
 [tool.pytest.ini_options]
-addopts = "-v --strict-markers"
+addopts = "-v --strict-markers --timeout=30"
 testpaths = ["tests"]
 markers = ["e2e: end-to-end tests requiring Docker, skopeo, and network"]
+# Fail-fast on hangs: any test exceeding 30s is killed and reported. Loopback
+# unit/integration tests run in <1s; e2e tests override per-test or skip.
+timeout_method = "thread"
 
 [tool.coverage.run]
 source = ["src/oci_modelcar"]

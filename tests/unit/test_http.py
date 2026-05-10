@@ -1,284 +1,223 @@
-import base64
 import json
 import ssl
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import requests
 import urllib3.exceptions
 
-from oci_modelcar.http import (
-    _SmartRetry,
-    build_session,
-    docker_config_auth,
-    huggingface_token,
-    is_transient_ssl,
-    oci_auth_header,
-)
+from oci_modelcar import __version__
+from oci_modelcar.http import _SmartRetry, build_session, is_transient_ssl
 
 
-def test_oci_auth_header_from_env(monkeypatch):
-    monkeypatch.setenv("OCI_USERNAME", "alice")
-    monkeypatch.setenv("OCI_PASSWORD", "s3cr3t")
-    hdr = oci_auth_header("registry.example.com")
-    expected = "Basic " + base64.b64encode(b"alice:s3cr3t").decode()
-    assert hdr == {"Authorization": expected}
-
-
-def test_oci_auth_header_from_docker_config(monkeypatch, tmp_path):
-    monkeypatch.delenv("OCI_USERNAME", raising=False)
-    monkeypatch.delenv("OCI_PASSWORD", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    cfg_dir = tmp_path / ".docker"
-    cfg_dir.mkdir()
-    raw = base64.b64encode(b"bob:hunter2").decode()
-    (cfg_dir / "config.json").write_text(
-        json.dumps({"auths": {"registry.example.com": {"auth": raw}}})
-    )
-    hdr = oci_auth_header("registry.example.com")
-    assert hdr == {"Authorization": f"Basic {raw}"}
-
-
-def test_oci_auth_header_no_creds(monkeypatch, tmp_path):
-    monkeypatch.delenv("OCI_USERNAME", raising=False)
-    monkeypatch.delenv("OCI_PASSWORD", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    assert oci_auth_header("registry.example.com") == {}
-
-
-def test_huggingface_token_from_env(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "hf_secret")
-    assert huggingface_token() == "hf_secret"
-
-
-def test_huggingface_token_from_cache_file(monkeypatch, tmp_path):
-    monkeypatch.delenv("HF_TOKEN", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    cache = tmp_path / ".cache" / "huggingface"
-    cache.mkdir(parents=True)
-    (cache / "token").write_text("hf_from_cache\n")
-    assert huggingface_token() == "hf_from_cache"
-
-
-def test_huggingface_token_none(monkeypatch, tmp_path):
-    monkeypatch.delenv("HF_TOKEN", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    assert huggingface_token() is None
-
-
-def test_build_session_has_user_agent():
+def test_session_has_default_user_agent(monkeypatch):
+    monkeypatch.delenv("OCI_MODELCAR_USER_AGENT", raising=False)
     s = build_session()
-    assert "oci-modelcar/" in s.headers["User-Agent"]
+    assert s.headers["User-Agent"] == f"oci-modelcar/{__version__}"
 
 
-def test_docker_config_auth_handles_missing(tmp_path):
-    assert docker_config_auth(tmp_path / "missing.json", "x") is None
-
-
-def test_docker_config_auth_longest_prefix_match(tmp_path):
-    """auths['host/repo'] matches target 'host/repo' AND deeper paths."""
-    cfg = tmp_path / "auth.json"
-    raw = base64.b64encode(b"u:p").decode()
-    cfg.write_text(json.dumps({"auths": {"artifactory.example/repo": {"auth": raw}}}))
-    # Exact match
-    assert docker_config_auth(cfg, "artifactory.example/repo") == raw
-    # Sub-path: target = host/repo/something — must match the host/repo entry
-    assert docker_config_auth(cfg, "artifactory.example/repo/sub") == raw
-    # Bare host: target = host alone — must NOT match a more specific entry
-    assert docker_config_auth(cfg, "artifactory.example") is None
-    # Different repo prefix: must not cross-match
-    assert docker_config_auth(cfg, "artifactory.example/other") is None
-
-
-def test_docker_config_auth_picks_most_specific_match(tmp_path):
-    """When several keys match, the longest wins."""
-    cfg = tmp_path / "auth.json"
-    bare = base64.b64encode(b"bare:x").decode()
-    deep = base64.b64encode(b"deep:y").decode()
-    cfg.write_text(
-        json.dumps(
-            {
-                "auths": {
-                    "artifactory.example": {"auth": bare},
-                    "artifactory.example/repo": {"auth": deep},
-                }
-            }
-        )
-    )
-    assert docker_config_auth(cfg, "artifactory.example/repo") == deep
-    assert docker_config_auth(cfg, "artifactory.example/other") == bare
-
-
-def test_docker_config_auth_normalizes_legacy_keys(tmp_path):
-    """Legacy docker keys with https:// prefix or /v2/ suffix still match."""
-    cfg = tmp_path / "auth.json"
-    a = base64.b64encode(b"a:1").decode()
-    b = base64.b64encode(b"b:2").decode()
-    cfg.write_text(
-        json.dumps(
-            {
-                "auths": {
-                    "https://legacy.example/v2/": {"auth": a},
-                    "https://other.example/": {"auth": b},
-                }
-            }
-        )
-    )
-    assert docker_config_auth(cfg, "legacy.example") == a
-    assert docker_config_auth(cfg, "other.example/repo") == b
-
-
-def test_oci_auth_header_uses_target_repo(monkeypatch, tmp_path):
-    """oci_auth_header passes target_repo so path-keyed auths match."""
-    monkeypatch.delenv("OCI_USERNAME", raising=False)
-    monkeypatch.delenv("OCI_PASSWORD", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    cfg_dir = tmp_path / ".docker"
-    cfg_dir.mkdir()
-    raw = base64.b64encode(b"who:cares").decode()
-    (cfg_dir / "config.json").write_text(
-        json.dumps({"auths": {"artifactory.example/myproject": {"auth": raw}}})
-    )
-    # Without target_repo: bare host has no entry → no auth
-    assert oci_auth_header("artifactory.example") == {}
-    # With target_repo: longest-prefix match resolves
-    hdr = oci_auth_header("artifactory.example", target_repo="myproject/model")
-    assert hdr == {"Authorization": f"Basic {raw}"}
-
-
-def test_oci_auth_header_searches_xdg_config_home(monkeypatch, tmp_path):
-    """Podman default $HOME/.config/containers/auth.json must be searched too."""
-    monkeypatch.delenv("OCI_USERNAME", raising=False)
-    monkeypatch.delenv("OCI_PASSWORD", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    cfg_dir = tmp_path / ".config" / "containers"
-    cfg_dir.mkdir(parents=True)
-    raw = base64.b64encode(b"pod:man").decode()
-    (cfg_dir / "auth.json").write_text(
-        json.dumps({"auths": {"registry.example.com": {"auth": raw}}})
-    )
-    assert oci_auth_header("registry.example.com") == {"Authorization": f"Basic {raw}"}
-
-
-def test_oci_auth_header_logs_anonymous_when_no_creds(monkeypatch, tmp_path, caplog):
-    """When no source matches, a WARNING surfaces — silent anonymous fallback hides 401s."""
-    import logging
-
-    monkeypatch.delenv("OCI_USERNAME", raising=False)
-    monkeypatch.delenv("OCI_PASSWORD", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    with caplog.at_level(logging.WARNING, logger="oci_modelcar.http"):
-        assert oci_auth_header("registry.example.com") == {}
-    assert any(
-        "anonymous" in r.getMessage().lower() or "no oci" in r.getMessage().lower()
-        for r in caplog.records
-    ), f"expected anonymous-fallback warning, got {[r.getMessage() for r in caplog.records]}"
-
-
-def test_oci_auth_header_logs_resolution_source(monkeypatch, tmp_path, caplog):
-    import logging
-
-    monkeypatch.delenv("OCI_USERNAME", raising=False)
-    monkeypatch.delenv("OCI_PASSWORD", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    cfg_dir = tmp_path / ".docker"
-    cfg_dir.mkdir()
-    raw = base64.b64encode(b"x:y").decode()
-    (cfg_dir / "config.json").write_text(
-        json.dumps({"auths": {"registry.example.com": {"auth": raw}}})
-    )
-    with caplog.at_level(logging.INFO, logger="oci_modelcar.http"):
-        oci_auth_header("registry.example.com")
-    assert any("config.json" in r.getMessage() for r in caplog.records), [
-        r.getMessage() for r in caplog.records
-    ]
-
-
-def test_smart_retry_raises_immediately_on_ssl_error():
-    """SSL errors must NOT be retried — they never recover from a CA misconfig.
-    increment() must surface the original exception so urllib3 stops retrying."""
-    retry = _SmartRetry(total=8, backoff_factor=2)
-    err = ssl.SSLError("CERTIFICATE_VERIFY_FAILED")
-    with pytest.raises(ssl.SSLError):
-        retry.increment(method="GET", url="https://example/", error=err)
-
-
-def test_smart_retry_raises_immediately_on_urllib3_ssl_error():
-    retry = _SmartRetry(total=8, backoff_factor=2)
-    err = urllib3.exceptions.SSLError("handshake failure")
-    with pytest.raises(urllib3.exceptions.SSLError):
-        retry.increment(method="GET", url="https://example/", error=err)
-
-
-def test_smart_retry_raises_immediately_on_proxy_error():
-    retry = _SmartRetry(total=8, backoff_factor=2)
-    err = urllib3.exceptions.ProxyError("bad proxy", OSError("nope"))
-    with pytest.raises(urllib3.exceptions.ProxyError):
-        retry.increment(method="GET", url="https://example/", error=err)
-
-
-def test_smart_retry_passes_through_other_errors():
-    """Non-fatal transport errors still consume retries normally."""
-    retry = _SmartRetry(total=8, backoff_factor=2)
-    err = urllib3.exceptions.ProtocolError("connection reset")
-    new_retry = retry.increment(method="GET", url="https://example/", error=err)
-    assert isinstance(new_retry, _SmartRetry)
-
-
-def test_build_session_uses_smart_retry():
-    """The session adapter must carry the SSL-aware retry policy."""
+def test_session_user_agent_overridable(monkeypatch):
+    monkeypatch.setenv("OCI_MODELCAR_USER_AGENT", "custom/1.0")
     s = build_session()
-    adapter = s.get_adapter("https://example/")
-    assert isinstance(adapter.max_retries, _SmartRetry)
+    assert s.headers["User-Agent"] == "custom/1.0"
 
 
-def test_is_transient_ssl_message_string():
-    """The canonical OpenSSL message is enough on its own (no chain required)."""
+def test_session_force_connection_close(monkeypatch):
+    monkeypatch.setenv("OCI_MODELCAR_FORCE_CONNECTION_CLOSE", "1")
+    s = build_session()
+    assert s.headers.get("Connection") == "close"
+
+
+def test_session_default_no_connection_close(monkeypatch):
+    monkeypatch.delenv("OCI_MODELCAR_FORCE_CONNECTION_CLOSE", raising=False)
+    s = build_session()
+    assert s.headers.get("Connection") != "close"
+
+
+def test_is_transient_ssl_true_for_eof():
+    e = ssl.SSLEOFError("EOF occurred in violation of protocol")
+    wrapped = requests.exceptions.SSLError(str(e))
+    wrapped.__cause__ = e
+    assert is_transient_ssl(wrapped) is True
+
+
+def test_is_transient_ssl_false_for_handshake():
+    e = ssl.SSLError("CERTIFICATE_VERIFY_FAILED")
+    wrapped = requests.exceptions.SSLError(str(e))
+    wrapped.__cause__ = e
+    assert is_transient_ssl(wrapped) is False
+
+
+def test_is_transient_ssl_via_message_match():
+    """Some wrappers don't preserve __cause__; fall back to message match."""
     e = requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2437)")
     assert is_transient_ssl(e) is True
 
 
-def test_is_transient_ssl_via_explicit_cause():
-    """`raise SSLError(...) from ssl.SSLEOFError(...)` exposes the inner type
-    via __cause__; isinstance walk must catch it even when the outer message
-    doesn't carry the marker string."""
-    inner = ssl.SSLEOFError("inner eof")
-    outer: requests.exceptions.SSLError
-    try:
-        raise requests.exceptions.SSLError("connection lost") from inner
-    except requests.exceptions.SSLError as e:
-        outer = e
-    assert is_transient_ssl(outer) is True
+def test_smart_retry_reraises_ssl():
+    r = _SmartRetry(total=5)
+    with pytest.raises(ssl.SSLError):
+        r.increment(error=ssl.SSLError("CERTIFICATE_VERIFY_FAILED"))
 
 
-def test_is_transient_ssl_via_implicit_context():
-    """Common urllib3/requests pattern: raise inside an except without `from`.
-    __cause__ stays None but __context__ holds the original SSLEOFError."""
-    outer: requests.exceptions.SSLError
-    try:
-        try:
-            raise ssl.SSLEOFError("inner eof")
-        except ssl.SSLEOFError:
-            raise requests.exceptions.SSLError("wrapped, no from clause")  # noqa: B904
-    except requests.exceptions.SSLError as e:
-        outer = e
-    assert is_transient_ssl(outer) is True
+def test_smart_retry_reraises_proxy():
+    r = _SmartRetry(total=5)
+    with pytest.raises(urllib3.exceptions.ProxyError):
+        r.increment(error=urllib3.exceptions.ProxyError("bad proxy", OSError()))
 
 
-def test_is_transient_ssl_handshake_error_is_not_transient():
-    """A pure CA/cert SSLError stays fatal."""
-    e = requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
-    assert is_transient_ssl(e) is False
+def _build_redirect_pair(original_url: str, redirect_url: str, auth: str | None):
+    """Construct (response, prepared_request) inputs to Session.rebuild_auth
+    that mirror what `requests` produces while following a redirect.
+
+    `response` represents the prior (3xx) response — its `.request.url` is
+    the URL we came from. `prepared_request` is the about-to-be-sent next
+    request whose Authorization header we want stripped or preserved."""
+    import requests as _requests
+
+    response = MagicMock()
+    response.request = MagicMock(url=original_url)
+    prepared = _requests.PreparedRequest()
+    prepared.prepare(method="GET", url=redirect_url)
+    if auth is not None:
+        prepared.headers["Authorization"] = auth
+    return response, prepared
 
 
-def test_is_transient_ssl_unrelated_exception_is_not_transient():
-    e = RuntimeError("not even an SSL error")
-    assert is_transient_ssl(e) is False
+def test_authorization_dropped_on_cross_origin_redirect():
+    """`_SafeSession.rebuild_auth` strips Authorization when the redirect
+    target's netloc differs from the original. Direct unit test on the
+    method — bypasses pytest-httpserver entirely, which has known
+    instability on small responses against the GitHub runner."""
+    from oci_modelcar.http import _SafeSession
+
+    s = _SafeSession()
+    response, prepared = _build_redirect_pair(
+        original_url="https://huggingface.co/repo/file",
+        redirect_url="https://cdn-lfs.huggingface.co/repo/file",
+        auth="Bearer hf_secret",
+    )
+    s.rebuild_auth(prepared, response)
+    assert "Authorization" not in prepared.headers
+
+
+def test_authorization_preserved_on_same_origin_redirect():
+    """Same-netloc redirects preserve Authorization."""
+    from oci_modelcar.http import _SafeSession
+
+    s = _SafeSession()
+    response, prepared = _build_redirect_pair(
+        original_url="https://registry.example.com/v2/models/x/manifests/v1",
+        redirect_url="https://registry.example.com/v2/models/x/blobs/sha256:abc",
+        auth="Bearer hf_secret",
+    )
+    s.rebuild_auth(prepared, response)
+    assert prepared.headers.get("Authorization") == "Bearer hf_secret"
+
+
+def test_authorization_dropped_on_port_change():
+    """Different ports on the same host → different netloc → strip."""
+    from oci_modelcar.http import _SafeSession
+
+    s = _SafeSession()
+    response, prepared = _build_redirect_pair(
+        original_url="https://example.com:443/a",
+        redirect_url="https://example.com:8443/b",
+        auth="Bearer hf_secret",
+    )
+    s.rebuild_auth(prepared, response)
+    assert "Authorization" not in prepared.headers
+
+
+def test_huggingface_token_from_hf_token_env(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "tok_a")
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_a"
+
+
+def test_huggingface_token_from_hub_token_env(monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "tok_b")
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_b"
+
+
+def test_huggingface_token_priority(monkeypatch):
+    """HF_TOKEN wins over HUGGING_FACE_HUB_TOKEN."""
+    monkeypatch.setenv("HF_TOKEN", "tok_a")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "tok_b")
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_a"
+
+
+def test_huggingface_token_disabled_by_env(monkeypatch):
+    """HF_HUB_DISABLE_IMPLICIT_TOKEN=1 returns None even if a token is set."""
+    monkeypatch.setenv("HF_TOKEN", "tok_a")
+    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() is None
+
+
+def test_huggingface_token_from_cache_file(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".cache" / "huggingface" / "token"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("tok_from_file\n")
+    from oci_modelcar.http import huggingface_token
+
+    assert huggingface_token() == "tok_from_file"
+
+
+def test_oci_auth_header_from_env(monkeypatch):
+    monkeypatch.setenv("OCI_USERNAME", "alice")
+    monkeypatch.setenv("OCI_PASSWORD", "s3cret")
+    from oci_modelcar.http import oci_auth_header
+
+    h = oci_auth_header("registry.example.com")
+    assert h["Authorization"].startswith("Basic ")
+
+
+def test_oci_auth_header_from_docker_config(monkeypatch, tmp_path):
+    import base64
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg = tmp_path / ".docker" / "config.json"
+    cfg.parent.mkdir(parents=True)
+    auth = base64.b64encode(b"alice:s3cret").decode()
+    cfg.write_text(json.dumps({"auths": {"registry.example.com": {"auth": auth}}}))
+    from oci_modelcar.http import oci_auth_header
+
+    h = oci_auth_header("registry.example.com")
+    assert h["Authorization"] == f"Basic {auth}"
+
+
+def test_oci_auth_anonymous_when_no_credentials(monkeypatch, tmp_path, caplog):
+    import logging
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    from oci_modelcar.http import oci_auth_header
+
+    with caplog.at_level(logging.WARNING):
+        h = oci_auth_header("registry.example.com")
+    assert h == {}
+    assert any("anonymously" in r.message for r in caplog.records)

@@ -1,10 +1,14 @@
-# oci-modelcar
+# oci-modelcar v1.0
 
 [![CI](https://github.com/codanael/oci-modelcar/actions/workflows/ci.yml/badge.svg)](https://github.com/codanael/oci-modelcar/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/oci-modelcar.svg)](https://pypi.org/project/oci-modelcar/)
 
-Stream HuggingFace models directly into OCI registries as multi-layer images,
+Push HuggingFace models to OCI registries as multi-layer images,
 suitable for KServe with native OCI image volumes (KEP-4639).
+
+v1.0 uses a per-file pipeline (download → tar → push) with a single PATCH
+per blob (Jib-style), eliminating per-PATCH routing decisions on Artifactory
+HA clusters and Harbor reverse-proxy setups.
 
 ## Why
 
@@ -13,18 +17,27 @@ Pushing a HuggingFace model to an OCI registry typically means:
 2. One huge layer: no cross-repo blob mount possible
 3. No resume: a 5 GB shard failing at 4.5 GB starts over
 
-`oci-modelcar` streams in pure Python:
-- HF -> registry directly, no disk persistence
+`oci-modelcar` handles this in pure Python:
+- Per-file pipeline: download, tar, and push run concurrently per file
 - One uncompressed tar layer per file (`digest == diff_id`)
-- Three-level resume: HF Range request, OCI session resync, file-level
-  state file
-- Memory bounded to ~16 MiB per worker
+- Single PATCH per blob — same wire shape as Jib and `containers/image`
+- Parallel workers (`--workers`, cap 8)
+
+## Documentation
+
+- [User guide](./docs/user-guide.md) — complete CLI reference, CI/CD examples, troubleshooting, exit codes
+- [CHANGELOG](./CHANGELOG.md) — release history, breaking changes
+- Design spec: [docs/superpowers/specs/2026-05-08-oci-modelcar-v1-design.md](./docs/superpowers/specs/2026-05-08-oci-modelcar-v1-design.md)
 
 ## Install
 
 ```bash
 pip install oci-modelcar
+# or via uv (recommended for CI)
+uv tool install oci-modelcar
 ```
+
+Requires Python 3.11+.
 
 ## Quick start
 
@@ -34,19 +47,40 @@ export OCI_USERNAME=...
 export OCI_PASSWORD=...
 
 oci-modelcar push \
-  --hf-repo Qwen/Qwen3-30B-A3B \
-  --registry registry.example.com \
-  --target-repo models/qwen3-30b
+  --hf-repo Qwen/Qwen2.5-7B-Instruct \
+  --registry registry.acme.com \
+  --target-repo models/qwen-7b
 ```
 
 The image tag defaults to the first 12 characters of the resolved HF commit
 SHA (e.g. `a3f47b09c8d2`).
 
+## Disk space
+
+v1 spools downloaded HF files and built tar layers under `--spool-dir`
+(default `$TMPDIR/oci-modelcar`). Roughly 2× the largest layer per worker
+in flight, plus the cumulative size of all source files unless
+`--clean-hf-after-push` is set. The push aborts up-front with a clear
+error if free space is insufficient.
+
+## Migration from v0.5
+
+v1.0 is a clean rewrite. Breaking changes:
+
+- `--state-file` removed (registry HEAD is the source of truth)
+- `--chunk-mib` removed (single PATCH per blob)
+- `--upload-mode` removed (one mode)
+- Default `--oci-max-retries` lowered from 10 to 5 (each retry is a full PATCH replay)
+- Two new flags: `--spool-dir`, `--clean-hf-after-push`
+
+See [CHANGELOG.md](./CHANGELOG.md) for full details.
+
 ## Authentication
 
 **HuggingFace** (aligned with `huggingface-cli`):
-- `HF_TOKEN` env var (recommended)
+- `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` env var (recommended)
 - `~/.cache/huggingface/token` (created by `huggingface-cli login`)
+- Opt-out: set `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` to skip implicit token sources
 
 **OCI registry**:
 - `OCI_USERNAME` + `OCI_PASSWORD` env vars (recommended for CI)
@@ -65,37 +99,39 @@ use plain HTTP. Pass an explicit `http://` or `https://` prefix on
 | `--target-tag` | `<sha[:12]>` | Image tag |
 | `--also-tag` | — | CSV of alias tags |
 | `--workers` | `1` | Parallel layers (cap 8) |
-| `--chunk-mib` | `32` | PATCH chunk size (MiB). Larger amortizes per-PATCH overhead — bumped from 8 in v0.5.0 after empirically validating a substantial speedup on real registries. Memory footprint is `~2 × chunk_mib × workers` MiB peak. |
-| `--state-file` | `~/.local/state/oci-modelcar/state.json` | JSON resume state |
+| `--spool-dir` | `$TMPDIR/oci-modelcar` | Directory for downloaded files and built tar layers |
+| `--clean-hf-after-push` | off | Delete each HF file after its layer is pushed |
+| `--oci-max-retries` | `5` | Max PATCH retries per blob (each is a full replay) |
 | `--fail-fast` / `--continue-on-error` | fail-fast | Failure policy |
 | `--log-style` | auto | `text` or `azure` |
 | `--dry-run` | — | List files, don't push |
 
-Full list: `oci-modelcar push --help`.
+Full list: `oci-modelcar push --help`. For complete usage, scenarios, and
+troubleshooting see [docs/user-guide.md](./docs/user-guide.md).
 
 ## Resume after failure
 
-State is automatically saved per file. If a push is killed (kill, OOM, network
-loss), re-running the same command resumes:
+v1 uses the registry as the source of truth. If a push is killed mid-way,
+re-running the same command skips blobs that are already present (HEAD check).
+No local state file is needed.
 
 ```bash
 # First run, killed mid-way
 oci-modelcar push --hf-repo X --registry Y --target-repo Z
 # ^C
 
-# Re-run: skips files already pushed
+# Re-run: blobs already in the registry are skipped
 oci-modelcar push --hf-repo X --registry Y --target-repo Z
 ```
 
-Force a full re-push with `--force`.
+Force a full re-push (ignoring HEAD results) with `--force`.
 
 ## OCI compliance
 
 Compliant with OCI Distribution v1.1 and OCI Image Spec v1.1:
-- Chunked PATCH uploads with `Content-Range: N-M` (inclusive, no `bytes`
-  prefix per OCI spec)
-- Resume via `GET /v2/<repo>/blobs/uploads/<id>` and the `Range: 0-N` header
-- `416 Range Not Satisfiable` is treated as "ask the server, sync, retry"
+- Single PATCH per blob with upfront `Content-Length` (Jib-style); on retry
+  the full PATCH is replayed from the local spool file
+- `Content-Range: N-M` (inclusive, no `bytes` prefix per OCI spec)
 - HEAD validation cross-checks `Docker-Content-Digest`
 - Layers use `application/vnd.oci.image.layer.v1.tar` (uncompressed) so
   `layer.digest == diff_id` by construction
@@ -140,7 +176,7 @@ attestations generated by GitHub Actions in keyless OIDC mode. Verify with:
 pip install pypi-attestations
 
 # Replace with the version you want to verify
-VERSION=0.5.0
+VERSION=1.0.0
 
 python -m pypi_attestations verify pypi \
     --repository https://github.com/codanael/oci-modelcar \
@@ -159,7 +195,7 @@ chains correctly through Sigstore (Fulcio cert + Rekor transparency log).
 ## Releasing (maintainers)
 
 1. Bump `version` in `pyproject.toml` and update `CHANGELOG.md`.
-2. Tag: `git tag v0.1.0 && git push --tags`.
+2. Tag: `git tag -a v1.0.0 -m 'release notes' && git push origin v1.0.0`.
 3. The `release.yml` workflow builds, publishes to PyPI via Trusted Publishing,
    and creates a GitHub Release.
 

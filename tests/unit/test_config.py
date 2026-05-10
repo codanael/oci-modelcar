@@ -1,21 +1,28 @@
 import pytest
 
-from oci_modelcar.config import Config, ConfigError
+from oci_modelcar.config import Config
+from oci_modelcar.errors import ConfigError
 
 
-def test_config_from_env_minimal(monkeypatch):
+def test_config_minimum_required(monkeypatch):
     monkeypatch.setenv("HF_REPO", "foo/bar")
     monkeypatch.setenv("REGISTRY", "registry.example.com")
     monkeypatch.setenv("TARGET_REPO", "models/x")
     cfg = Config.from_env_and_args([])
     assert cfg.hf_repo == "foo/bar"
-    assert cfg.hf_revision == "main"
-    assert cfg.hf_endpoint == "https://huggingface.co"
     assert cfg.registry == "registry.example.com"
     assert cfg.target_repo == "models/x"
-    assert cfg.target_tag is None  # derived later
+    assert cfg.hf_revision == "main"
+    assert cfg.hf_endpoint == "https://huggingface.co"
     assert cfg.workers == 1
-    assert cfg.chunk_mib == 32
+
+
+def test_config_missing_required(monkeypatch):
+    monkeypatch.delenv("HF_REPO", raising=False)
+    monkeypatch.delenv("REGISTRY", raising=False)
+    monkeypatch.delenv("TARGET_REPO", raising=False)
+    with pytest.raises(ConfigError, match="hf_repo"):
+        Config.from_env_and_args([])
 
 
 def test_config_cli_overrides_env(monkeypatch):
@@ -27,20 +34,20 @@ def test_config_cli_overrides_env(monkeypatch):
     assert cfg.workers == 2
 
 
-def test_config_missing_required_raises(monkeypatch):
-    monkeypatch.delenv("HF_REPO", raising=False)
-    monkeypatch.delenv("REGISTRY", raising=False)
-    monkeypatch.delenv("TARGET_REPO", raising=False)
-    with pytest.raises(ConfigError, match="hf_repo"):
-        Config.from_env_and_args([])
-
-
 def test_config_workers_cap(monkeypatch):
     monkeypatch.setenv("HF_REPO", "foo/bar")
     monkeypatch.setenv("REGISTRY", "registry.example.com")
     monkeypatch.setenv("TARGET_REPO", "models/x")
     with pytest.raises(ConfigError, match="workers"):
         Config.from_env_and_args(["--workers", "9"])
+
+
+def test_config_workers_zero_raises(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(ConfigError, match="workers"):
+        Config.from_env_and_args(["--workers", "0"])
 
 
 def test_config_invalid_target_tag(monkeypatch):
@@ -51,24 +58,7 @@ def test_config_invalid_target_tag(monkeypatch):
         Config.from_env_and_args(["--target-tag", "bad/tag"])
 
 
-def test_config_workers_zero_raises(monkeypatch):
-    """--workers 0 must reach validate() and be rejected, not silently default to 1."""
-    monkeypatch.setenv("HF_REPO", "foo/bar")
-    monkeypatch.setenv("REGISTRY", "registry.example.com")
-    monkeypatch.setenv("TARGET_REPO", "models/x")
-    with pytest.raises(ConfigError, match="workers"):
-        Config.from_env_and_args(["--workers", "0"])
-
-
-def test_config_chunk_mib_zero_raises(monkeypatch):
-    monkeypatch.setenv("HF_REPO", "foo/bar")
-    monkeypatch.setenv("REGISTRY", "registry.example.com")
-    monkeypatch.setenv("TARGET_REPO", "models/x")
-    with pytest.raises(ConfigError, match="chunk_mib"):
-        Config.from_env_and_args(["--chunk-mib", "0"])
-
-
-def test_verbose_and_quiet_env_mutually_exclusive(monkeypatch):
+def test_config_verbose_quiet_mutually_exclusive(monkeypatch):
     monkeypatch.setenv("HF_REPO", "foo/bar")
     monkeypatch.setenv("REGISTRY", "registry.example.com")
     monkeypatch.setenv("TARGET_REPO", "models/x")
@@ -78,18 +68,118 @@ def test_verbose_and_quiet_env_mutually_exclusive(monkeypatch):
         Config.from_env_and_args([])
 
 
-def test_empty_env_string_falls_back_to_default(monkeypatch):
+def test_config_spool_dir_default(monkeypatch):
     monkeypatch.setenv("HF_REPO", "foo/bar")
     monkeypatch.setenv("REGISTRY", "registry.example.com")
     monkeypatch.setenv("TARGET_REPO", "models/x")
-    monkeypatch.setenv("HF_REVISION", "")  # empty -> use "main"
+    monkeypatch.delenv("SPOOL_DIR", raising=False)
     cfg = Config.from_env_and_args([])
-    assert cfg.hf_revision == "main"
+    assert cfg.spool_dir.name == "oci-modelcar"
 
 
-def test_hf_max_retries_negative_raises(monkeypatch):
+def test_config_spool_dir_cli(monkeypatch, tmp_path):
     monkeypatch.setenv("HF_REPO", "foo/bar")
     monkeypatch.setenv("REGISTRY", "registry.example.com")
     monkeypatch.setenv("TARGET_REPO", "models/x")
-    with pytest.raises(ConfigError, match="hf_max_retries"):
-        Config.from_env_and_args(["--hf-max-retries", "-1"])
+    cfg = Config.from_env_and_args(["--spool-dir", str(tmp_path)])
+    assert cfg.spool_dir == tmp_path
+
+
+def test_config_spool_dir_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("SPOOL_DIR", str(tmp_path))
+    cfg = Config.from_env_and_args([])
+    assert cfg.spool_dir == tmp_path
+
+
+def test_config_clean_hf_after_push_default_false(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.delenv("CLEAN_HF_AFTER_PUSH", raising=False)
+    cfg = Config.from_env_and_args([])
+    assert cfg.clean_hf_after_push is False
+
+
+def test_config_clean_hf_after_push_cli(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--clean-hf-after-push"])
+    assert cfg.clean_hf_after_push is True
+
+
+def test_config_clean_hf_after_push_env(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("CLEAN_HF_AFTER_PUSH", "1")
+    cfg = Config.from_env_and_args([])
+    assert cfg.clean_hf_after_push is True
+
+
+def test_config_oci_max_retries_default_5(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args([])
+    assert cfg.oci_max_retries == 5
+
+
+def test_config_continue_on_error_overrides_fail_fast(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--continue-on-error"])
+    assert cfg.fail_fast is False
+
+
+def test_config_also_tags_csv(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--also-tag", "v1.0,latest,prod"])
+    assert cfg.also_tags == ["v1.0", "latest", "prod"]
+
+
+def test_config_also_tags_invalid_raises(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(ConfigError, match="also_tag"):
+        Config.from_env_and_args(["--also-tag", "bad/tag"])
+
+
+def test_config_log_style_invalid_raises(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--log-style", "bogus"])
+
+
+def test_config_chunk_mib_flag_rejected(monkeypatch):
+    """v0.x removed flag — argparse should error."""
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--chunk-mib", "32"])
+
+
+def test_config_state_file_flag_rejected(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--state-file", "/tmp/x.json"])
+
+
+def test_config_upload_mode_flag_rejected(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    with pytest.raises(SystemExit):
+        Config.from_env_and_args(["--upload-mode", "chunked"])

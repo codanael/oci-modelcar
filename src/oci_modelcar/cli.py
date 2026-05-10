@@ -1,182 +1,152 @@
-"""CLI entry point: push / status / validate sub-commands."""
+"""CLI entrypoint: argparse dispatch on argv[1] sub-command."""
 
 from __future__ import annotations
 
+import argparse
+import logging
 import sys
-from collections.abc import Sequence
 
-from oci_modelcar import __version__
-from oci_modelcar.config import ConfigError
+from huggingface_hub import HfApi
 
-# Exit codes
-_EX_OK = 0
-_EX_GENERIC = 1
-_EX_FAIL_FAST = 2
-_EX_CONTINUE_ON_ERROR = 3
-_EX_CONFIG = 64
-_EX_AUTH = 65
-_EX_SIGINT = 130
+from oci_modelcar.config import Config
+from oci_modelcar.download import HfDownloader
+from oci_modelcar.errors import OciModelcarError, exit_code_for
+from oci_modelcar.http import build_session
+from oci_modelcar.logging import PipelineLogger
+from oci_modelcar.pipeline import Pipeline
+from oci_modelcar.registry import OciClient, head_blob
 
-_USAGE = f"""\
-oci-modelcar {__version__}
-
-Usage: oci-modelcar <sub-command> [options]
-
-Sub-commands:
-  push      Stream a HuggingFace model into an OCI registry
-  status    Show job summaries from the state file
-  validate  Verify that a manifest tag is reachable in the registry
-
-Run `oci-modelcar push --help` for per-subcommand options.
-"""
+log = logging.getLogger(__name__)
 
 
-def _print_top_help() -> None:
-    sys.stdout.write(_USAGE)
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv
+
+    if len(argv) < 2:
+        print("usage: oci-modelcar {push,status,validate} [options]", file=sys.stderr)
+        return 1
+
+    sub = argv[1]
+    rest = argv[2:]
+
+    if sub == "push":
+        return _run_push(rest)
+    if sub == "status":
+        return _run_status(rest)
+    if sub == "validate":
+        return _run_validate(rest)
+
+    print(f"unknown sub-command: {sub}", file=sys.stderr)
+    return 1
 
 
 def _run_push(argv: list[str]) -> int:
-    from oci_modelcar import runner
-    from oci_modelcar.config import Config
-    from oci_modelcar.logging import PipelineLogger, detect_log_style
+    try:
+        cfg = Config.from_env_and_args(argv)
+    except OciModelcarError as e:
+        print(f"error: {e}", file=sys.stderr)
+        if e.hint:
+            print(f"hint: {e.hint}", file=sys.stderr)
+        return exit_code_for(e)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 2
 
-    cfg = Config.from_env_and_args(argv)
-    style = detect_log_style(cfg.log_style)
-    plog = PipelineLogger(
-        style=style,
-        verbose=cfg.verbose,
-        quiet=cfg.quiet,
+    plog = PipelineLogger(log_style=cfg.log_style or "text", verbose=cfg.verbose, quiet=cfg.quiet)
+    session = build_session()
+    api = HfApi(endpoint=cfg.hf_endpoint)
+    downloader = HfDownloader(
+        api=api,
+        session=session,
+        spool_dir=cfg.spool_dir,
+        stop_event=None,
+        max_retries=cfg.hf_max_retries,
     )
-    result = runner.run_push(cfg, plog)
-    if result.failed:
-        return _EX_CONTINUE_ON_ERROR if not cfg.fail_fast else _EX_FAIL_FAST
-    return _EX_OK
+    registry_client = OciClient(
+        registry_host=cfg.registry,
+        target_repo=cfg.target_repo,
+        session=session,
+    )
+    pipeline = Pipeline(
+        cfg=cfg,
+        plog=plog,
+        downloader=downloader,
+        registry_client=registry_client,
+    )
+    try:
+        pipeline.run()
+        return 0
+    except OciModelcarError as e:
+        plog.error(f"{type(e).__name__}: {e}")
+        if e.hint:
+            plog.error(f"hint: {e.hint}")
+        return exit_code_for(e)
+    except KeyboardInterrupt:
+        plog.error("interrupted")
+        return 1
 
 
 def _run_status(argv: list[str]) -> int:
-    import argparse
-    import os
-    from pathlib import Path
-
-    from oci_modelcar.state import JsonStateStore
-
-    def _xdg_state_home() -> Path:
-        raw = os.environ.get("XDG_STATE_HOME")
-        if raw:
-            return Path(raw)
-        return Path.home() / ".local" / "state"
-
     p = argparse.ArgumentParser(prog="oci-modelcar status")
-    p.add_argument(
-        "--state-file",
-        default=None,
-        help="Path to the state file (default: $XDG_STATE_HOME/oci-modelcar/state.json)",
-    )
+    p.add_argument("--registry", required=True)
+    p.add_argument("--target-repo", required=True)
+    p.add_argument("--log-style", default=None, choices=["text", "azure"])
+    p.add_argument("--quiet", action="store_true", default=False)
+    p.add_argument("--verbose", action="store_true", default=False)
     ns = p.parse_args(argv)
-    state_path = Path(
-        ns.state_file
-        or os.environ.get("STATE_FILE")
-        or str(_xdg_state_home() / "oci-modelcar" / "state.json")
-    )
-    if not state_path.is_file():
-        sys.stderr.write(f"State file not found: {state_path}\n")
-        return _EX_GENERIC
 
-    store = JsonStateStore(state_path)
-    keys = store.list_jobs()
-    if not keys:
-        sys.stdout.write("No jobs found.\n")
-        return _EX_OK
-
-    for key in keys:
-        job = store.get_job(key)
-        if job is None:
-            continue
-        src = job.get("source", {})
-        tgt = job.get("target", {})
-        digest = job.get("manifest_digest") or "(pending)"
-        completed = job.get("completed_at") or "(in-progress)"
-        sys.stdout.write(
-            f"job={key[:12]}  "
-            f"{src.get('hf_repo', '?')}@{src.get('hf_revision_resolved', '?')}  "
-            f"-> {tgt.get('registry', '?')}/{tgt.get('repo', '?')}:{tgt.get('tag', '?')}  "
-            f"digest={digest[:23]}  completed={completed}\n"
+    plog = PipelineLogger(log_style=ns.log_style or "text", verbose=ns.verbose, quiet=ns.quiet)
+    client = OciClient(registry_host=ns.registry, target_repo=ns.target_repo)
+    url = client.url(ns.target_repo, "tags", "list")
+    r = client.session.get(url, headers=client.auth, timeout=30)
+    if r.status_code == 404:
+        plog.info(f"repo {ns.target_repo} not found in {ns.registry}")
+        return 0
+    r.raise_for_status()
+    tags = r.json().get("tags", []) or []
+    plog.info(f"Tags in {ns.target_repo} @ {ns.registry}:")
+    for tag in tags:
+        url = client.url(ns.target_repo, "manifests", tag)
+        h = client.session.head(
+            url,
+            headers={**client.auth, "Accept": "application/vnd.oci.image.manifest.v1+json"},
+            timeout=30,
         )
-        image_ref_digest = job.get("image_ref_digest")
-        if image_ref_digest:
-            sys.stdout.write(f"    ref={image_ref_digest}\n")
-    return _EX_OK
+        digest = h.headers.get("Docker-Content-Digest", "?")
+        plog.info(f"  {tag}  {digest}")
+    return 0
 
 
 def _run_validate(argv: list[str]) -> int:
-    import argparse
-
-    from oci_modelcar.oci import ML_MAN, OciClient
-
     p = argparse.ArgumentParser(prog="oci-modelcar validate")
-    p.add_argument("--registry", required=True, help="Registry host (e.g. ghcr.io)")
-    p.add_argument("--target-repo", required=True, help="Repository name")
-    p.add_argument("--target-tag", required=True, help="Tag to validate")
+    p.add_argument("--registry", required=True)
+    p.add_argument("--target-repo", required=True)
+    p.add_argument("--target-tag", required=True)
+    p.add_argument("--log-style", default=None, choices=["text", "azure"])
+    p.add_argument("--quiet", action="store_true", default=False)
+    p.add_argument("--verbose", action="store_true", default=False)
     ns = p.parse_args(argv)
 
-    registry: str = ns.registry
-    repo: str = ns.target_repo
-    tag: str = ns.target_tag
+    plog = PipelineLogger(log_style=ns.log_style or "text", verbose=ns.verbose, quiet=ns.quiet)
+    client = OciClient(registry_host=ns.registry, target_repo=ns.target_repo)
 
-    client = OciClient(registry_host=registry)
-    url = client.url(repo, "manifests", tag)
-    r = client.session.get(url, headers={**client.auth, "Accept": ML_MAN}, timeout=30)
-    if r.status_code == 200:
-        digest = r.headers.get("Docker-Content-Digest", "(no digest)")
-        sys.stdout.write(f"OK  {registry}/{repo}:{tag}  {digest}\n")
-        return _EX_OK
-    elif r.status_code in (401, 403):
-        sys.stderr.write(f"Auth error {r.status_code}: {registry}/{repo}:{tag}\n")
-        return _EX_AUTH
-    else:
-        sys.stderr.write(f"Manifest not found or error {r.status_code}: {registry}/{repo}:{tag}\n")
-        return _EX_GENERIC
+    url = client.url(ns.target_repo, "manifests", ns.target_tag)
+    r = client.session.get(
+        url,
+        headers={**client.auth, "Accept": "application/vnd.oci.image.manifest.v1+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    manifest = r.json()
+    config_digest = manifest["config"]["digest"]
+    layers = manifest["layers"]
 
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point: dispatch to push / status / validate or print help."""
-    if argv is None:
-        argv = sys.argv[1:]
-    args = list(argv)
-
-    if not args or args[0] in ("-h", "--help"):
-        _print_top_help()
-        return _EX_OK
-
-    if args[0] in ("-V", "--version"):
-        sys.stdout.write(f"oci-modelcar {__version__}\n")
-        return _EX_OK
-
-    sub = args[0]
-    rest = args[1:]
-
-    try:
-        if sub == "push":
-            return _run_push(rest)
-        elif sub == "status":
-            return _run_status(rest)
-        elif sub == "validate":
-            return _run_validate(rest)
-        else:
-            sys.stderr.write(f"Unknown sub-command: {sub!r}\n\n")
-            _print_top_help()
-            return _EX_CONFIG
-    except ConfigError as exc:
-        sys.stderr.write(f"Configuration error: {exc}\n")
-        return _EX_CONFIG
-    except KeyboardInterrupt:
-        sys.stderr.write("\nInterrupted.\n")
-        return _EX_SIGINT
-    except SystemExit as exc:
-        code = exc.code
-        if isinstance(code, int):
-            return code
-        return _EX_GENERIC
-    except Exception as exc:
-        sys.stderr.write(f"Error: {exc}\n")
-        return _EX_GENERIC
+    if head_blob(client, ns.target_repo, config_digest) is None:
+        plog.error(f"config blob missing: {config_digest}")
+        return 1
+    for layer in layers:
+        if head_blob(client, ns.target_repo, layer["digest"]) is None:
+            plog.error(f"layer missing: {layer['digest']}")
+            return 1
+    plog.info(f"manifest at {ns.target_tag} is coherent ({len(layers)} layers)")
+    return 0
