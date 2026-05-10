@@ -7,6 +7,14 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Top-level `oci-modelcar --help`/`-h` now prints usage to stdout and exits 0
   instead of treating `--help` as an unknown sub-command (#10).
+- Bad `--hf-revision` (and missing repos / gated repos / missing entries)
+  no longer escape as raw `huggingface_hub.errors.*` tracebacks. The
+  upstream `RevisionNotFoundError`, `RepositoryNotFoundError`,
+  `GatedRepoError`, and `EntryNotFoundError` raised by
+  `HfApi.repo_info()` and `HfApi.list_repo_tree()` are now remapped to
+  our typed exceptions in `download.py`, so the CLI surface produces the
+  documented one-line error + actionable hint and the matching exit
+  code (3 for gated, 5 for not-found cases) (#11).
 - Reword the no-OCI-credentials warning so it makes sense for read-only
   `status`/`validate` calls as well as `push`. Now says "proceeding
   anonymously" and notes that protected registries return 401 on writes

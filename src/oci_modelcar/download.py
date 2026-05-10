@@ -18,6 +18,7 @@ from typing import Any
 import requests
 import urllib3.exceptions
 from huggingface_hub import HfApi
+from huggingface_hub import errors as hf_errors
 from huggingface_hub.hf_api import RepoFile
 
 from oci_modelcar.errors import (
@@ -70,7 +71,23 @@ class HfDownloader:
         self.backoff_cap = backoff_cap
 
     def resolve_revision(self, repo: str, revision: str) -> str:
-        info = self.api.repo_info(repo, revision=revision)
+        try:
+            info = self.api.repo_info(repo, revision=revision)
+        except hf_errors.GatedRepoError as e:
+            raise GatedRepoError(
+                f"Repo {repo} is gated: {e}",
+                hint=f"Accept terms at https://huggingface.co/{repo}, then re-run.",
+            ) from e
+        except hf_errors.RevisionNotFoundError as e:
+            raise RevisionNotFoundError(
+                f"Revision not found: {repo}@{revision}: {e}",
+                hint=f"check available revisions at https://huggingface.co/{repo}",
+            ) from e
+        except hf_errors.RepositoryNotFoundError as e:
+            raise DownloadError(
+                f"Repository not found: {repo}: {e}",
+                hint=f"check the repo name at https://huggingface.co/{repo}",
+            ) from e
         # ModelInfo.sha is `str | None` per huggingface_hub typings — the
         # backend may legitimately omit it. Guard against silently passing
         # the literal string "None" downstream into resolve URLs.
@@ -83,7 +100,27 @@ class HfDownloader:
 
     def list_files(self, repo: str, revision: str, allow: tuple[str, ...]) -> list[HfFile]:
         out: list[HfFile] = []
-        for _entry in self.api.list_repo_tree(repo, revision=revision, recursive=True):
+        try:
+            tree = self.api.list_repo_tree(repo, revision=revision, recursive=True)
+            entries = list(tree)
+        except hf_errors.GatedRepoError as e:
+            raise GatedRepoError(
+                f"Repo {repo} is gated: {e}",
+                hint=f"Accept terms at https://huggingface.co/{repo}, then re-run.",
+            ) from e
+        except hf_errors.RevisionNotFoundError as e:
+            raise RevisionNotFoundError(
+                f"Revision not found: {repo}@{revision}: {e}",
+                hint=f"check available revisions at https://huggingface.co/{repo}",
+            ) from e
+        except hf_errors.EntryNotFoundError as e:
+            raise EntryNotFoundError(f"Entry not found in {repo}@{revision}: {e}") from e
+        except hf_errors.RepositoryNotFoundError as e:
+            raise DownloadError(
+                f"Repository not found: {repo}: {e}",
+                hint=f"check the repo name at https://huggingface.co/{repo}",
+            ) from e
+        for _entry in entries:
             # Narrow to files. huggingface_hub yields RepoFile/RepoFolder; the
             # canonical discriminant is isinstance(RepoFile) — RepoFolder has
             # no `.size`/`.lfs`. Tests use MagicMock(spec=RepoFile) so
