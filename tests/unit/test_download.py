@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from huggingface_hub import HfApi
 from pytest_httpserver import HTTPServer
 
@@ -170,13 +171,31 @@ def test_download_calls_progress_cb(httpserver: HTTPServer, tmp_path: Path) -> N
     assert seen[-1] == len(payload)
 
 
-def test_download_partial_file_cleaned_on_exception(httpserver: HTTPServer, tmp_path: Path) -> None:
-    """If the GET fails repeatedly, the .partial file is removed."""
-    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data("", status=503)
-    spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
-    f = HfFile(path="file.bin", size=10, lfs_sha256=None)
+def test_download_partial_file_cleaned_on_exception(tmp_path: Path) -> None:
+    """If the GET fails repeatedly, the .partial file is removed.
 
+    Mock-based to avoid urllib3 `_SmartRetry`'s exponential backoff on
+    503 (cumulative ~8 minutes on the wire, blowing past the test
+    timeout) and the 3.14/werkzeug short-non-2xx interaction. We inject
+    a session that always raises a transport error; the retry loop
+    surfaces a DownloadError after `max_retries` attempts and the
+    finally block must still clean up the partial file."""
+    fake_session = MagicMock()
+    fake_session.get.side_effect = requests.exceptions.ConnectionError("simulated")
+
+    api = MagicMock()
+    api.endpoint = "http://hf"
+
+    spool = tmp_path / "spool"
+    d = HfDownloader(
+        api=api,
+        session=fake_session,
+        spool_dir=spool,
+        stop_event=None,
+        max_retries=2,
+        backoff_initial=0.0,
+    )
+    f = HfFile(path="file.bin", size=10, lfs_sha256=None)
     with pytest.raises(DownloadError):
         d.download("repo", "main", f)
     partial = spool / "sources" / "file.bin.partial"
@@ -283,29 +302,63 @@ def test_range_200_fallback_truncates_partial_and_restarts(tmp_path: Path) -> No
     assert sent_headers.get("Range") == "bytes=300-"
 
 
-def test_download_gated_repo_raises_specific_error(httpserver: HTTPServer, tmp_path: Path) -> None:
-    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_data(
-        "Gated", status=403, headers={"X-Error-Code": "GatedRepo"}
-    )
-    spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
-    f = HfFile(path="file.bin", size=10, lfs_sha256=None)
+def test_download_gated_repo_raises_specific_error(tmp_path: Path) -> None:
+    """Mock-based: the httpserver-driven version hung indefinitely on
+    Python 3.14 + werkzeug for short non-2xx responses (likely a keep-
+    alive interaction with http.client). Direct injection of a fake
+    HTTPError-bearing Response avoids the entire HTTP layer."""
+    fake_response = MagicMock()
+    fake_response.status_code = 403
+    fake_response.headers = {"X-Error-Code": "GatedRepo"}
+    fake_response.request = MagicMock(url="http://hf/repo/resolve/main/file.bin")
+    http_err = requests.exceptions.HTTPError(response=fake_response)
+    fake_response.raise_for_status.side_effect = http_err
 
+    fake_session = MagicMock()
+    fake_session.get.return_value = fake_response
+
+    api = MagicMock()
+    api.endpoint = "http://hf"
+
+    d = HfDownloader(
+        api=api,
+        session=fake_session,
+        spool_dir=tmp_path,
+        stop_event=None,
+        max_retries=2,
+        backoff_initial=0.0,
+    )
+    f = HfFile(path="file.bin", size=10, lfs_sha256=None)
     with pytest.raises(GatedRepoError) as exc:
         d.download("repo", "main", f)
     assert exc.value.hint and "huggingface.co/repo" in exc.value.hint
 
 
-def test_download_404_on_resolve_raises_entry_not_found(
-    httpserver: HTTPServer, tmp_path: Path
-) -> None:
-    httpserver.expect_request("/repo/resolve/main/missing.bin").respond_with_data(
-        "Not found", status=404
-    )
-    spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
-    f = HfFile(path="missing.bin", size=10, lfs_sha256=None)
+def test_download_404_on_resolve_raises_entry_not_found(tmp_path: Path) -> None:
+    """Mock-based for the same 3.14 / werkzeug short-non-2xx hang reason
+    as the gated-repo test. Direct injection avoids the HTTP layer."""
+    fake_response = MagicMock()
+    fake_response.status_code = 404
+    fake_response.headers = {}
+    fake_response.request = MagicMock(url="http://hf/repo/resolve/main/missing.bin")
+    http_err = requests.exceptions.HTTPError(response=fake_response)
+    fake_response.raise_for_status.side_effect = http_err
 
+    fake_session = MagicMock()
+    fake_session.get.return_value = fake_response
+
+    api = MagicMock()
+    api.endpoint = "http://hf"
+
+    d = HfDownloader(
+        api=api,
+        session=fake_session,
+        spool_dir=tmp_path,
+        stop_event=None,
+        max_retries=2,
+        backoff_initial=0.0,
+    )
+    f = HfFile(path="missing.bin", size=10, lfs_sha256=None)
     with pytest.raises(EntryNotFoundError):
         d.download("repo", "main", f)
 
