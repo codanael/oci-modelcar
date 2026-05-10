@@ -401,3 +401,86 @@ def test_download_lfs_sha_mismatch_raises(tmp_path: Path) -> None:
     f = HfFile(path="file.bin", size=len(payload), lfs_sha256=wrong_sha)
     with pytest.raises(DownloadError, match="sha256 mismatch"):
         d.download("repo", "main", f)
+
+
+def _hf_error_response() -> MagicMock:
+    """huggingface_hub.errors.HfHubHTTPError requires a response with .headers
+    and .request attributes during construction. Build a minimal mock satisfying
+    that contract so we can inject the upstream exceptions in tests."""
+    import httpx
+
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 404
+    resp.headers = {}
+    resp.request = MagicMock()
+    resp.request.method = "GET"
+    resp.url = "http://hf/api/models/repo"
+    return resp
+
+
+def test_resolve_revision_remaps_hf_revision_not_found() -> None:
+    from huggingface_hub.errors import RevisionNotFoundError as HfRevNotFound
+
+    from oci_modelcar.errors import RevisionNotFoundError, exit_code_for
+
+    api = MagicMock()
+    api.repo_info.side_effect = HfRevNotFound(
+        "Revision deadbeef does not exist", response=_hf_error_response()
+    )
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+
+    with pytest.raises(RevisionNotFoundError) as exc:
+        d.resolve_revision("Qwen/Qwen2.5-7B", "deadbeef")
+    assert "deadbeef" in str(exc.value)
+    assert exc.value.hint and "huggingface.co/Qwen/Qwen2.5-7B" in exc.value.hint
+    assert exit_code_for(exc.value) == 5
+
+
+def test_resolve_revision_remaps_hf_repository_not_found() -> None:
+    from huggingface_hub.errors import RepositoryNotFoundError as HfRepoNotFound
+
+    from oci_modelcar.errors import DownloadError, exit_code_for
+
+    api = MagicMock()
+    api.repo_info.side_effect = HfRepoNotFound(
+        "Repository nope/missing not found", response=_hf_error_response()
+    )
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+
+    with pytest.raises(DownloadError) as exc:
+        d.resolve_revision("nope/missing", "main")
+    assert "nope/missing" in str(exc.value)
+    assert exc.value.hint and "huggingface.co/nope/missing" in exc.value.hint
+    assert exit_code_for(exc.value) == 5
+
+
+def test_resolve_revision_remaps_hf_gated_repo() -> None:
+    from huggingface_hub.errors import GatedRepoError as HfGatedRepo
+
+    from oci_modelcar.errors import GatedRepoError, exit_code_for
+
+    api = MagicMock()
+    api.repo_info.side_effect = HfGatedRepo(
+        "Repo meta/llama is gated", response=_hf_error_response()
+    )
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+
+    with pytest.raises(GatedRepoError) as exc:
+        d.resolve_revision("meta/llama", "main")
+    assert exc.value.hint and "huggingface.co/meta/llama" in exc.value.hint
+    assert exit_code_for(exc.value) == 3
+
+
+def test_list_files_remaps_hf_entry_not_found() -> None:
+    from huggingface_hub.errors import EntryNotFoundError as HfEntryNotFound
+
+    from oci_modelcar.errors import EntryNotFoundError, exit_code_for
+
+    api = MagicMock()
+    api.list_repo_tree.side_effect = HfEntryNotFound("Entry missing in tree")
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+
+    with pytest.raises(EntryNotFoundError) as exc:
+        d.list_files("Qwen/Qwen2.5-7B", "main", allow=(".safetensors",))
+    assert "missing" in str(exc.value).lower()
+    assert exit_code_for(exc.value) == 5
