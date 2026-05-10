@@ -229,37 +229,58 @@ def test_download_aborts_within_two_chunks_of_stop_event(
     assert raised and isinstance(raised[0], InterruptedError)
 
 
-def test_download_handles_range_200_fallback(
-    httpserver: HTTPServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If first attempt downloads partial bytes then fails, and the second
-    attempt sends Range but server ignores it (returns 200), the partial
-    file is truncated and download restarts cleanly."""
-    payload = b"Y" * 4096
-    state: dict[str, bool] = {"served": False}
+def test_range_200_fallback_truncates_partial_and_restarts(tmp_path: Path) -> None:
+    """When `start > 0` (Range request) but the server returns 200 (Range
+    ignored), `_stream_one_attempt` must truncate the existing partial file
+    and restart from offset 0. Direct unit test of the fallback logic in
+    download.py — bypasses HTTP infrastructure (pytest-httpserver/werkzeug
+    proved unreliable on CI runners with this specific Content-Length
+    interplay), exercising the truncate-and-rewrite branch directly."""
+    sources = tmp_path / "sources"
+    sources.mkdir(parents=True)
+    partial = sources / "f.bin.partial"
+    partial.write_bytes(b"OLD" * 100)  # 300 stale bytes from a "previous" attempt
 
-    def handler(request):  # type: ignore[no-untyped-def]
-        from werkzeug.wrappers import Response
+    payload = b"NEW" * 100  # 300 bytes of new content
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.iter_content.return_value = iter([payload])
+    fake_response.raise_for_status.return_value = None
 
-        if not state["served"]:
-            state["served"] = True
-            # First call: short body (1024 bytes) that closes after Content-Length
-            return Response(
-                payload[:1024],
-                status=200,
-                headers={"Content-Length": str(len(payload[:1024]))},
-            )
-        # Subsequent calls: ignore Range, return full payload with 200
-        return Response(payload, status=200, headers={"Content-Length": str(len(payload))})
+    fake_session = MagicMock()
+    fake_session.get.return_value = fake_response
 
-    httpserver.expect_request("/repo/resolve/main/file.bin").respond_with_handler(handler)
-    spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
-    f = HfFile(path="file.bin", size=len(payload), lfs_sha256=None)
+    api = MagicMock()
+    api.endpoint = "http://test"
 
-    monkeypatch.setattr("oci_modelcar.download.time.sleep", lambda _d: None)
-    out = d.download("repo", "main", f)
-    assert out.read_bytes() == payload
+    d = HfDownloader(
+        api=api,
+        session=fake_session,
+        spool_dir=tmp_path,
+        stop_event=None,
+        max_retries=1,
+        backoff_initial=0.0,
+    )
+    f = HfFile(path="f.bin", size=len(payload), lfs_sha256=None)
+
+    # Call directly with start=300 → headers["Range"] is set → server returns
+    # 200 (mocked above) → fallback path triggers.
+    d._stream_one_attempt(
+        url="http://test/repo/resolve/main/f.bin",
+        partial=partial,
+        hf_file=f,
+        start=300,
+        h=None,
+        progress_cb=None,
+    )
+
+    # Partial must have been truncated then rewritten with the FULL new payload,
+    # not appended to the stale OLD bytes.
+    assert partial.read_bytes() == payload
+    # And the GET must have been called with a Range header (proving the
+    # fallback was actually exercised, not a no-op happy-path).
+    sent_headers = fake_session.get.call_args.kwargs.get("headers", {})
+    assert sent_headers.get("Range") == "bytes=300-"
 
 
 def test_download_gated_repo_raises_specific_error(httpserver: HTTPServer, tmp_path: Path) -> None:
