@@ -23,11 +23,21 @@ Pushing a HuggingFace model to an OCI registry typically means:
 - Single PATCH per blob — same wire shape as Jib and `containers/image`
 - Parallel workers (`--workers`, cap 8)
 
+## Documentation
+
+- [User guide](./docs/user-guide.md) — complete CLI reference, CI/CD examples, troubleshooting, exit codes
+- [CHANGELOG](./CHANGELOG.md) — release history, breaking changes
+- Design spec: [docs/superpowers/specs/2026-05-08-oci-modelcar-v1-design.md](./docs/superpowers/specs/2026-05-08-oci-modelcar-v1-design.md)
+
 ## Install
 
 ```bash
 pip install oci-modelcar
+# or via uv (recommended for CI)
+uv tool install oci-modelcar
 ```
+
+Requires Python 3.14+.
 
 ## Quick start
 
@@ -96,7 +106,8 @@ use plain HTTP. Pass an explicit `http://` or `https://` prefix on
 | `--log-style` | auto | `text` or `azure` |
 | `--dry-run` | — | List files, don't push |
 
-Full list: `oci-modelcar push --help`.
+Full list: `oci-modelcar push --help`. For complete usage, scenarios, and
+troubleshooting see [docs/user-guide.md](./docs/user-guide.md).
 
 ## Resume after failure
 
@@ -184,7 +195,7 @@ chains correctly through Sigstore (Fulcio cert + Rekor transparency log).
 ## Releasing (maintainers)
 
 1. Bump `version` in `pyproject.toml` and update `CHANGELOG.md`.
-2. Tag: `git tag v0.1.0 && git push --tags`.
+2. Tag: `git tag -a v1.0.0 -m 'release notes' && git push origin v1.0.0`.
 3. The `release.yml` workflow builds, publishes to PyPI via Trusted Publishing,
    and creates a GitHub Release.
 
