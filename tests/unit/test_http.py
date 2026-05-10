@@ -221,3 +221,23 @@ def test_oci_auth_anonymous_when_no_credentials(monkeypatch, tmp_path, caplog):
         h = oci_auth_header("registry.example.com")
     assert h == {}
     assert any("anonymously" in r.message for r in caplog.records)
+
+
+def test_oci_auth_anonymous_warning_is_op_neutral(monkeypatch, tmp_path, caplog):
+    """The warning is emitted for read-only ops (status/validate) too, so it
+    must not say "pushing". It should still mention "anonymously" so the
+    intent (no credentials in use) is preserved."""
+    import logging
+
+    monkeypatch.delenv("OCI_USERNAME", raising=False)
+    monkeypatch.delenv("OCI_PASSWORD", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    from oci_modelcar.http import oci_auth_header
+
+    with caplog.at_level(logging.WARNING):
+        oci_auth_header("registry.example.com")
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("anonymously" in m for m in messages)
+    assert not any("pushing" in m.lower() for m in messages)
