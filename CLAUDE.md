@@ -156,9 +156,11 @@ explaining why in the PR.
   This allows re-running with `--force` without re-downloading. Set it in
   space-constrained environments (containers with small ephemeral storage).
 - **`errors.py` exit codes 0..7** mapped to specific exception classes.
-  Exit code contract: 0=success, 1=partial failure, 2=usage/config error,
-  3=gated repo, 4=revision not found, 5=entry not found, 6=disk space,
-  7=push error. Don't renumber without updating `cli.py` and the spec.
+  Exit code contract: 0=success, 1=generic/unhandled, 2=`ConfigError`,
+  3=`GatedRepoError`, 4=`DiskSpaceError`, 5=`DownloadError` (incl.
+  `RevisionNotFoundError`, `EntryNotFoundError`), 6=`PushError`,
+  7=`PartialFailureError`. Don't renumber without updating `cli.py`,
+  `docs/user-guide.md` (the §Exit codes table), and the spec.
 - **Registry HEAD is the source of truth for resumability.** No local state
   file (`state.json` was removed in v1.0). Blobs already present in the
   registry are detected via HEAD check and skipped. `--force` bypasses HEAD.
