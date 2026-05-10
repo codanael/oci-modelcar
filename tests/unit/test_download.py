@@ -3,26 +3,17 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
-from huggingface_hub import HfApi
-from pytest_httpserver import HTTPServer
 
 from oci_modelcar.download import HfDownloader, HfFile
 from oci_modelcar.errors import DownloadError, EntryNotFoundError, GatedRepoError
-from oci_modelcar.http import build_session
 
 
-def _make_downloader(httpserver: HTTPServer, spool: Path) -> HfDownloader:
-    api = HfApi(endpoint=httpserver.url_for(""))
-    # Use a session with no urllib3 retries so test-level max_retries drives the loop
-    session = build_session()
-    session.adapters.clear()
-    from requests.adapters import HTTPAdapter as _Adapter
-
-    session.mount("http://", _Adapter(max_retries=0))
-    session.mount("https://", _Adapter(max_retries=0))
+def _make_downloader(fake_session: MagicMock, spool: Path) -> HfDownloader:
+    api = MagicMock()
+    api.endpoint = "http://hf"
     return HfDownloader(
         api=api,
-        session=session,
+        session=fake_session,
         spool_dir=spool,
         stop_event=None,
         max_retries=3,
@@ -125,14 +116,10 @@ def test_list_files_extracts_lfs_sha256():
     assert by_path["config.json"].lfs_sha256 is None
 
 
-def test_download_writes_file_and_returns_path(httpserver: HTTPServer, tmp_path: Path) -> None:
+def test_download_writes_file_and_returns_path(tmp_path: Path) -> None:
     payload = b"hello world"
-    httpserver.expect_request("/repo/resolve/main/file.txt").respond_with_data(
-        payload, headers={"Content-Length": str(len(payload))}
-    )
-
     spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
+    d = _make_downloader(_make_session_serving_payload(payload), spool)
     f = HfFile(path="file.txt", size=len(payload), lfs_sha256=None)
 
     result = d.download("repo", "main", f)
@@ -141,14 +128,10 @@ def test_download_writes_file_and_returns_path(httpserver: HTTPServer, tmp_path:
     assert not (spool / "sources" / "file.txt.partial").exists()
 
 
-def test_download_preserves_subdirs_in_hf_path(httpserver: HTTPServer, tmp_path: Path) -> None:
+def test_download_preserves_subdirs_in_hf_path(tmp_path: Path) -> None:
     payload = b"sub"
-    httpserver.expect_request("/repo/resolve/main/subdir/inner.txt").respond_with_data(
-        payload, headers={"Content-Length": str(len(payload))}
-    )
-
     spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
+    d = _make_downloader(_make_session_serving_payload(payload), spool)
     f = HfFile(path="subdir/inner.txt", size=len(payload), lfs_sha256=None)
 
     result = d.download("repo", "main", f)
@@ -156,13 +139,10 @@ def test_download_preserves_subdirs_in_hf_path(httpserver: HTTPServer, tmp_path:
     assert result.read_bytes() == payload
 
 
-def test_download_calls_progress_cb(httpserver: HTTPServer, tmp_path: Path) -> None:
+def test_download_calls_progress_cb(tmp_path: Path) -> None:
     payload = b"X" * 4096
-    httpserver.expect_request("/repo/resolve/main/big.bin").respond_with_data(
-        payload, headers={"Content-Length": str(len(payload))}
-    )
     spool = tmp_path / "spool"
-    d = _make_downloader(httpserver, spool)
+    d = _make_downloader(_make_session_serving_payload(payload), spool)
     f = HfFile(path="big.bin", size=len(payload), lfs_sha256=None)
 
     seen: list[int] = []
@@ -203,28 +183,35 @@ def test_download_partial_file_cleaned_on_exception(tmp_path: Path) -> None:
     assert not partial.exists() and not final.exists()
 
 
-def test_download_aborts_within_two_chunks_of_stop_event(
-    httpserver: HTTPServer, tmp_path: Path
-) -> None:
+def test_download_aborts_within_two_chunks_of_stop_event(tmp_path: Path) -> None:
     """Regression test for v0.x: 50 GB DL was uncancellable. v1 must cancel
-    within ~2 x CHUNK_DEFAULT (~2 MiB) of stop_event.set()."""
+    within ~2 x CHUNK_DEFAULT (~2 MiB) of stop_event.set().
+
+    Mock-based: iter_content yields 8 MiB chunks; progress_cb sets the stop
+    event after the first chunk, so the second chunk poll must see it set and
+    raise InterruptedError. No real HTTP server needed."""
     import threading
 
-    big_payload = b"X" * (8 * 1024 * 1024)
-    httpserver.expect_request("/repo/resolve/main/big.bin").respond_with_data(
-        big_payload, headers={"Content-Length": str(len(big_payload))}
-    )
+    chunk = b"X" * (1024 * 1024)  # 1 MiB per chunk
+    n_chunks = 8
+    total = len(chunk) * n_chunks
+
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.headers = {"Content-Length": str(total)}
+    fake_response.raise_for_status.return_value = None
+    # iter_content yields many chunks so the stop_event check is exercised
+    fake_response.iter_content.return_value = iter([chunk] * n_chunks)
+
+    fake_session = MagicMock()
+    fake_session.get.return_value = fake_response
+
     spool = tmp_path / "spool"
     stop = threading.Event()
-    api = HfApi(endpoint=httpserver.url_for(""))
-    session = build_session()
-    session.adapters.clear()
-    from requests.adapters import HTTPAdapter as _Adapter
-
-    session.mount("http://", _Adapter(max_retries=0))
-    session.mount("https://", _Adapter(max_retries=0))
-    d = HfDownloader(api=api, session=session, spool_dir=spool, stop_event=stop, max_retries=1)
-    f = HfFile(path="big.bin", size=len(big_payload), lfs_sha256=None)
+    api = MagicMock()
+    api.endpoint = "http://hf"
+    d = HfDownloader(api=api, session=fake_session, spool_dir=spool, stop_event=stop, max_retries=1)
+    f = HfFile(path="big.bin", size=total, lfs_sha256=None)
 
     chunks_seen = 0
     raised: list[BaseException] = []
