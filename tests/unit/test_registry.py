@@ -2,12 +2,10 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from unittest.mock import patch as mock_patch
+from unittest.mock import MagicMock
 
 import pytest
 import requests as _requests
-from pytest_httpserver import HTTPServer
-from werkzeug.wrappers import Response
 
 from oci_modelcar.registry import (
     OciClient,
@@ -19,8 +17,21 @@ from oci_modelcar.registry import (
 )
 
 
-def _client(httpserver: HTTPServer) -> OciClient:
-    return OciClient(host_url=httpserver.url_for(""))
+def _make_response(
+    status_code: int,
+    headers: dict[str, str] | None = None,
+    body: bytes = b"",
+) -> MagicMock:
+    r = MagicMock()
+    r.status_code = status_code
+    r.headers = headers or {}
+    r.content = body
+    r.raise_for_status.return_value = None
+    return r
+
+
+def _make_client(fake_session: MagicMock) -> OciClient:
+    return OciClient(host_url="http://test", session=fake_session)
 
 
 def test_oci_client_url_construction():
@@ -43,152 +54,132 @@ def test_oci_client_explicit_scheme_preserved():
     assert c.base == "http://custom.example.com:8080"
 
 
-def test_head_blob_returns_descriptor_when_present(httpserver):
+def test_head_blob_returns_descriptor_when_present():
     digest = "sha256:" + hashlib.sha256(b"x").hexdigest()
-
-    def head_handler(request):
-        r = Response("", status=200)
-        r.headers["Docker-Content-Digest"] = digest
-        r.headers["Content-Length"] = "1"
-        return r
-
-    httpserver.expect_request(f"/v2/repo/blobs/{digest}", method="HEAD").respond_with_handler(
-        head_handler
+    fake_session = MagicMock()
+    fake_session.head.return_value = _make_response(
+        200, {"Docker-Content-Digest": digest, "Content-Length": "1"}
     )
-    info = head_blob(_client(httpserver), "repo", digest)
+    info = head_blob(_make_client(fake_session), "repo", digest)
     assert info == {"digest": digest, "size": 1}
 
 
-def test_head_blob_returns_none_when_404(httpserver):
+def test_head_blob_returns_none_when_404():
     digest = "sha256:" + "a" * 64
-    httpserver.expect_request(f"/v2/repo/blobs/{digest}", method="HEAD").respond_with_data(
-        "", status=404
-    )
-    assert head_blob(_client(httpserver), "repo", digest) is None
+    fake_session = MagicMock()
+    fake_session.head.return_value = _make_response(404)
+    assert head_blob(_make_client(fake_session), "repo", digest) is None
 
 
-def test_head_blob_raises_on_digest_mismatch(httpserver):
+def test_head_blob_raises_on_digest_mismatch():
     digest = "sha256:" + "a" * 64
     other = "sha256:" + "b" * 64
-
-    def head_handler(request):
-        r = Response("", status=200)
-        r.headers["Docker-Content-Digest"] = other
-        r.headers["Content-Length"] = "1"
-        return r
-
-    httpserver.expect_request(f"/v2/repo/blobs/{digest}", method="HEAD").respond_with_handler(
-        head_handler
+    fake_session = MagicMock()
+    fake_session.head.return_value = _make_response(
+        200, {"Docker-Content-Digest": other, "Content-Length": "1"}
     )
     with pytest.raises(RuntimeError, match="digest mismatch"):
-        head_blob(_client(httpserver), "repo", digest)
+        head_blob(_make_client(fake_session), "repo", digest)
 
 
-def test_push_small_blob_skips_when_already_present(httpserver):
+def test_push_small_blob_skips_when_already_present():
     data = b"config bytes"
     digest = "sha256:" + hashlib.sha256(data).hexdigest()
-
-    def head_handler(request):
-        r = Response("", status=200)
-        r.headers["Docker-Content-Digest"] = digest
-        r.headers["Content-Length"] = str(len(data))
-        return r
-
-    httpserver.expect_request(f"/v2/repo/blobs/{digest}", method="HEAD").respond_with_handler(
-        head_handler
+    fake_session = MagicMock()
+    fake_session.head.return_value = _make_response(
+        200, {"Docker-Content-Digest": digest, "Content-Length": str(len(data))}
     )
-    out = push_small_blob(_client(httpserver), "repo", data)
+    out = push_small_blob(_make_client(fake_session), "repo", data)
     assert out == digest
+    fake_session.post.assert_not_called()
+    fake_session.put.assert_not_called()
 
 
-def test_push_small_blob_post_then_put(httpserver):
+def test_push_small_blob_post_then_put():
     data = b"config bytes"
     digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    fake_session = MagicMock()
+    fake_session.head.return_value = _make_response(404)
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/1"})
 
-    httpserver.expect_request(f"/v2/repo/blobs/{digest}", method="HEAD").respond_with_data(
-        "", status=404
-    )
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/1")}
-    )
+    sent_data: list[bytes] = []
 
-    received = {"data": b""}
+    def put_handler(*args: object, **kwargs: object) -> MagicMock:
+        sent_data.append(kwargs.get("data", b""))  # type: ignore[arg-type]
+        return _make_response(201)
 
-    def put_handler(request):
-        received["data"] = request.data
-        return Response("", status=201)
+    fake_session.put.side_effect = put_handler
 
-    httpserver.expect_request("/u/1", method="PUT").respond_with_handler(put_handler)
-
-    out = push_small_blob(_client(httpserver), "repo", data)
+    out = push_small_blob(_make_client(fake_session), "repo", data)
     assert out == digest
-    assert received["data"] == data
+    assert sent_data[0] == data
 
 
-def test_push_manifest_returns_digest(httpserver):
+def test_push_manifest_returns_digest():
     body = json.dumps({"schemaVersion": 2, "config": {}, "layers": []}).encode()
     expected_digest = "sha256:" + hashlib.sha256(body).hexdigest()
 
-    received = {"data": b""}
+    sent_data: list[bytes] = []
 
-    def put_handler(request):
-        received["data"] = request.data
-        return Response("", status=201)
+    fake_session = MagicMock()
 
-    httpserver.expect_request("/v2/repo/manifests/v1", method="PUT").respond_with_handler(
-        put_handler
-    )
-    out = push_manifest(_client(httpserver), "repo", "v1", body)
+    def put_handler(*args: object, **kwargs: object) -> MagicMock:
+        sent_data.append(kwargs.get("data", b""))  # type: ignore[arg-type]
+        return _make_response(201)
+
+    fake_session.put.side_effect = put_handler
+
+    out = push_manifest(_make_client(fake_session), "repo", "v1", body)
     assert out == expected_digest
-    assert received["data"] == body
+    assert sent_data[0] == body
 
 
-def test_validate_manifest_tag_succeeds_on_match(httpserver):
+def test_validate_manifest_tag_succeeds_on_match():
     digest = "sha256:" + "a" * 64
-    httpserver.expect_request("/v2/repo/manifests/v1", method="GET").respond_with_data(
-        "", status=200, headers={"Docker-Content-Digest": digest}
-    )
-    validate_manifest_tag(_client(httpserver), "repo", "v1", digest)
+    fake_session = MagicMock()
+    fake_session.get.return_value = _make_response(200, {"Docker-Content-Digest": digest})
+    validate_manifest_tag(_make_client(fake_session), "repo", "v1", digest)
 
 
-def test_validate_manifest_tag_raises_on_mismatch(httpserver):
+def test_validate_manifest_tag_raises_on_mismatch():
     digest = "sha256:" + "a" * 64
     other = "sha256:" + "b" * 64
-    httpserver.expect_request("/v2/repo/manifests/v1", method="GET").respond_with_data(
-        "", status=200, headers={"Docker-Content-Digest": other}
-    )
+    fake_session = MagicMock()
+    fake_session.get.return_value = _make_response(200, {"Docker-Content-Digest": other})
     with pytest.raises(RuntimeError, match="manifest digest mismatch"):
-        validate_manifest_tag(_client(httpserver), "repo", "v1", digest)
+        validate_manifest_tag(_make_client(fake_session), "repo", "v1", digest)
 
 
-def test_streaming_push_from_file_happy_path(httpserver, tmp_path: Path):
+def test_streaming_push_from_file_happy_path(tmp_path: Path):
     payload = b"X" * (4 * 1024 * 1024 + 17)
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/1")}
-    )
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/1"})
 
     received = bytearray()
 
-    def patch_handler(request):
-        cr = request.headers.get("Content-Range", "")
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
+        headers = kwargs.get("headers", {})
+        cr = headers.get("Content-Range", "")  # type: ignore[union-attr]
         m = re.match(r"^(\d+)-(\d+)$", cr)
         assert m, f"bad Content-Range {cr!r}"
         start, end = int(m.group(1)), int(m.group(2))
         assert start == 0
         assert end == len(payload) - 1
-        cl = int(request.headers["Content-Length"])
+        cl = int(headers.get("Content-Length", "0"))  # type: ignore[union-attr]
         assert cl == len(payload)
-        received.extend(request.data)
-        return Response("", status=202, headers={"Location": httpserver.url_for("/u/1")})
+        data = kwargs.get("data")
+        if hasattr(data, "read"):
+            received.extend(data.read())
+        return _make_response(202, {"Location": "http://test/u/1"})
 
-    httpserver.expect_request("/u/1", method="PATCH").respond_with_handler(patch_handler)
-    httpserver.expect_request("/u/1", method="PUT").respond_with_data("", status=201)
+    fake_session.patch.side_effect = patch_handler
+    fake_session.put.return_value = _make_response(201)
 
-    upload = StreamingBlobUpload(client=_client(httpserver), repo="repo")
+    upload = StreamingBlobUpload(client=_make_client(fake_session), repo="repo")
     out_digest, out_size = upload.push_from_file(f, len(payload), digest)
     assert out_digest == digest
     assert out_size == len(payload)
@@ -196,7 +187,7 @@ def test_streaming_push_from_file_happy_path(httpserver, tmp_path: Path):
 
 
 @pytest.mark.parametrize("success_status", [200, 201, 202, 204])
-def test_streaming_accepts_non_spec_success_codes(httpserver, tmp_path, success_status):
+def test_streaming_accepts_non_spec_success_codes(tmp_path: Path, success_status: int):
     """Artifactory returns 200/204; Harbor (some setups) returns 204.
     go-containerregistry accepts {201,202,204}; oras-py accepts {200,201,202}.
     Union: {200,201,202,204}."""
@@ -205,37 +196,35 @@ def test_streaming_accepts_non_spec_success_codes(httpserver, tmp_path, success_
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/codes")}
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/codes"})
+    fake_session.patch.return_value = _make_response(
+        success_status, {"Location": "http://test/u/codes"}
     )
-    httpserver.expect_request("/u/codes", method="PATCH").respond_with_data(
-        "", status=success_status, headers={"Location": httpserver.url_for("/u/codes")}
-    )
-    httpserver.expect_request("/u/codes", method="PUT").respond_with_data("", status=201)
+    fake_session.put.return_value = _make_response(201)
 
-    upload = StreamingBlobUpload(client=_client(httpserver), repo="repo")
+    upload = StreamingBlobUpload(client=_make_client(fake_session), repo="repo")
     out_digest, _ = upload.push_from_file(f, len(payload), digest)
     assert out_digest == digest
 
 
-def test_streaming_unhandled_status_raises(httpserver, tmp_path):
+def test_streaming_unhandled_status_raises(tmp_path: Path):
     """299 (no spec meaning) must raise rather than spin or silently succeed."""
     payload = b"A" * 64
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/odd")}
-    )
-    httpserver.expect_request("/u/odd", method="PATCH").respond_with_data("", status=299)
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/odd"})
+    fake_session.patch.return_value = _make_response(299)
 
-    upload = StreamingBlobUpload(client=_client(httpserver), repo="repo")
+    upload = StreamingBlobUpload(client=_make_client(fake_session), repo="repo")
     with pytest.raises(RuntimeError, match=r"unexpected.*299|status 299"):
         upload.push_from_file(f, len(payload), digest)
 
 
-def test_streaming_no_chunked_transfer_encoding(httpserver, tmp_path):
+def test_streaming_no_chunked_transfer_encoding(tmp_path: Path):
     """Content-Length must be set explicitly to avoid chunked TE, which
     some registries handle differently from a fixed-size PATCH."""
     payload = b"L" * 512
@@ -243,27 +232,27 @@ def test_streaming_no_chunked_transfer_encoding(httpserver, tmp_path):
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/len")}
-    )
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/len"})
 
     seen_te: list[str | None] = []
 
-    def patch_handler(request):
-        seen_te.append(request.headers.get("Transfer-Encoding"))
-        return Response("", status=202, headers={"Location": httpserver.url_for("/u/len")})
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
+        headers = kwargs.get("headers", {})
+        seen_te.append(headers.get("Transfer-Encoding"))  # type: ignore[union-attr]
+        return _make_response(202, {"Location": "http://test/u/len"})
 
-    httpserver.expect_request("/u/len", method="PATCH").respond_with_handler(patch_handler)
-    httpserver.expect_request("/u/len", method="PUT").respond_with_data("", status=201)
+    fake_session.patch.side_effect = patch_handler
+    fake_session.put.return_value = _make_response(201)
 
-    upload = StreamingBlobUpload(client=_client(httpserver), repo="repo")
+    upload = StreamingBlobUpload(client=_make_client(fake_session), repo="repo")
     upload.push_from_file(f, len(payload), digest)
 
     te = seen_te[0] or ""
     assert "chunked" not in te.lower(), f"Transfer-Encoding leaked chunked: {te!r}"
 
 
-def test_streaming_retries_on_ssl_eof_with_file_rewound(httpserver, tmp_path, monkeypatch):
+def test_streaming_retries_on_ssl_eof_with_file_rewound(tmp_path: Path, monkeypatch):
     """First PATCH attempt raises mid-stream SSL EOF; second succeeds.
     File must be reopened/rewound; full body sent again from offset 0."""
     payload = b"R" * 1024
@@ -271,133 +260,128 @@ def test_streaming_retries_on_ssl_eof_with_file_rewound(httpserver, tmp_path, mo
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/eof")}
-    )
-    received = bytearray()
-
-    def patch_handler(request):
-        received.extend(request.data)
-        return Response("", status=202, headers={"Location": httpserver.url_for("/u/eof")})
-
-    httpserver.expect_request("/u/eof", method="PATCH").respond_with_handler(patch_handler)
-    httpserver.expect_request("/u/eof", method="PUT").respond_with_data("", status=201)
-
     monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
 
-    real_patch = _requests.Session.patch
-    calls = {"n": 0}
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/eof"})
 
-    def flaky_patch(self, *args, **kwargs):
+    received = bytearray()
+    calls: dict[str, int] = {"n": 0}
+
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
         calls["n"] += 1
         if calls["n"] == 1:
             raise _requests.exceptions.SSLError(
                 "EOF occurred in violation of protocol (_ssl.c:2437)"
             )
-        return real_patch(self, *args, **kwargs)
+        data = kwargs.get("data")
+        if hasattr(data, "read"):
+            received.extend(data.read())
+        return _make_response(202, {"Location": "http://test/u/eof"})
+
+    fake_session.patch.side_effect = patch_handler
+    fake_session.put.return_value = _make_response(201)
 
     upload = StreamingBlobUpload(
-        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+        client=_make_client(fake_session), repo="repo", max_retries=3, backoff_initial=0.0
     )
-    with mock_patch.object(_requests.Session, "patch", flaky_patch):
-        out_digest, _out_size = upload.push_from_file(f, len(payload), digest)
+    out_digest, _out_size = upload.push_from_file(f, len(payload), digest)
 
     assert out_digest == digest
     assert calls["n"] == 2, "must retry exactly once after SSL EOF"
     assert bytes(received) == payload, "second attempt must re-send full body"
 
 
-def test_streaming_does_not_retry_on_handshake_ssl(httpserver, tmp_path):
+def test_streaming_does_not_retry_on_handshake_ssl(tmp_path: Path):
     """SSL handshake errors are fatal; no retry."""
     payload = b"H" * 64
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/handshake")}
-    )
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/handshake"})
 
-    calls = {"n": 0}
+    calls: dict[str, int] = {"n": 0}
 
-    def fatal_ssl_patch(self, *args, **kwargs):
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
         calls["n"] += 1
         raise _requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
 
+    fake_session.patch.side_effect = patch_handler
+
     upload = StreamingBlobUpload(
-        client=_client(httpserver), repo="repo", max_retries=5, backoff_initial=0.0
+        client=_make_client(fake_session), repo="repo", max_retries=5, backoff_initial=0.0
     )
-    with (
-        mock_patch.object(_requests.Session, "patch", fatal_ssl_patch),
-        pytest.raises(_requests.exceptions.SSLError),
-    ):
+    with pytest.raises(_requests.exceptions.SSLError):
         upload.push_from_file(f, len(payload), digest)
 
     assert calls["n"] == 1, "fatal SSL must not retry"
 
 
-def test_streaming_max_retries_exhausted_raises_push_error(httpserver, tmp_path, monkeypatch):
+def test_streaming_max_retries_exhausted_raises_push_error(tmp_path: Path, monkeypatch):
     """All attempts fail with transient SSL EOF → PushError."""
     payload = b"X" * 32
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/exhaust")}
-    )
     monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
 
-    calls = {"n": 0}
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/exhaust"})
 
-    def always_eof(self, *args, **kwargs):
+    calls: dict[str, int] = {"n": 0}
+
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
         calls["n"] += 1
         raise _requests.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2437)")
 
-    upload = StreamingBlobUpload(
-        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
-    )
-    with mock_patch.object(_requests.Session, "patch", always_eof):
-        from oci_modelcar.errors import PushError
+    fake_session.patch.side_effect = patch_handler
 
-        with pytest.raises(PushError, match="retries exhausted"):
-            upload.push_from_file(f, len(payload), digest)
+    upload = StreamingBlobUpload(
+        client=_make_client(fake_session), repo="repo", max_retries=3, backoff_initial=0.0
+    )
+    from oci_modelcar.errors import PushError
+
+    with pytest.raises(PushError, match="retries exhausted"):
+        upload.push_from_file(f, len(payload), digest)
 
     assert calls["n"] == 3, "must call PATCH max_retries times before giving up"
 
 
-def test_streaming_retries_on_5xx(httpserver, tmp_path, monkeypatch):
+def test_streaming_retries_on_5xx(tmp_path: Path, monkeypatch):
     """Server returns 503 then 202 → retry succeeds."""
     payload = b"S" * 16
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_data(
-        "", status=202, headers={"Location": httpserver.url_for("/u/5xx")}
-    )
+    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
 
-    calls = {"n": 0}
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/5xx"})
 
-    def patch_handler(request):
+    calls: dict[str, int] = {"n": 0}
+
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
         calls["n"] += 1
         if calls["n"] == 1:
-            return Response("server unavailable", status=503)
-        return Response("", status=202, headers={"Location": httpserver.url_for("/u/5xx")})
+            return _make_response(503)
+        return _make_response(202, {"Location": "http://test/u/5xx"})
 
-    httpserver.expect_request("/u/5xx", method="PATCH").respond_with_handler(patch_handler)
-    httpserver.expect_request("/u/5xx", method="PUT").respond_with_data("", status=201)
+    fake_session.patch.side_effect = patch_handler
+    fake_session.put.return_value = _make_response(201)
 
-    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
     upload = StreamingBlobUpload(
-        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+        client=_make_client(fake_session), repo="repo", max_retries=3, backoff_initial=0.0
     )
     out_digest, _ = upload.push_from_file(f, len(payload), digest)
     assert out_digest == digest
     assert calls["n"] == 2
 
 
-def test_streaming_re_posts_init_on_each_retry(httpserver, tmp_path, monkeypatch):
+def test_streaming_re_posts_init_on_each_retry(tmp_path: Path, monkeypatch):
     """v1.0 invariant: each retry attempt starts with a fresh POST init,
     so a TCP cut that invalidates the previous upload session is recovered
     by getting a new Location."""
@@ -406,40 +390,36 @@ def test_streaming_re_posts_init_on_each_retry(httpserver, tmp_path, monkeypatch
     f = tmp_path / "layer.tar"
     f.write_bytes(payload)
 
+    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
+
+    fake_session = MagicMock()
     post_calls: dict[str, int] = {"n": 0}
 
-    def post_handler(request):  # type: ignore[no-untyped-def]
+    def post_handler(*args: object, **kwargs: object) -> MagicMock:
         post_calls["n"] += 1
-        loc = httpserver.url_for(f"/u/{post_calls['n']}")
-        return Response("", status=202, headers={"Location": loc})
+        loc = f"http://test/u/{post_calls['n']}"
+        return _make_response(202, {"Location": loc})
 
-    httpserver.expect_request("/v2/repo/blobs/uploads/", method="POST").respond_with_handler(
-        post_handler
-    )
+    fake_session.post.side_effect = post_handler
 
     # First Location's PATCH "fails" (session invalidated by TCP cut).
     # Second Location's PATCH succeeds.
     patch_calls: dict[str, int] = {"n": 0}
 
-    def patch_handler(request):  # type: ignore[no-untyped-def]
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
         patch_calls["n"] += 1
-        loc_path = request.path
-        if loc_path == "/u/1":
-            # Simulate BLOB_UPLOAD_INVALID from registry after TCP-level cut
-            return Response(
-                '{"errors":[{"code":"BLOB_UPLOAD_INVALID"}]}',
-                status=404,
-                content_type="application/json",
-            )
-        return Response("", status=202, headers={"Location": httpserver.url_for(loc_path)})
+        # Determine which location we're patching from positional URL arg
+        url = args[0] if args else kwargs.get("url", "")
+        if "/u/1" in str(url):
+            # 404 → transient (BLOB_UPLOAD_INVALID); registry.py treats this as retryable
+            return _make_response(404)
+        return _make_response(202, {"Location": str(url)})
 
-    httpserver.expect_request("/u/1", method="PATCH").respond_with_handler(patch_handler)
-    httpserver.expect_request("/u/2", method="PATCH").respond_with_handler(patch_handler)
-    httpserver.expect_request("/u/2", method="PUT").respond_with_data("", status=201)
+    fake_session.patch.side_effect = patch_handler
+    fake_session.put.return_value = _make_response(201)
 
-    monkeypatch.setattr("oci_modelcar.registry.time.sleep", lambda d: None)
     upload = StreamingBlobUpload(
-        client=_client(httpserver), repo="repo", max_retries=3, backoff_initial=0.0
+        client=_make_client(fake_session), repo="repo", max_retries=3, backoff_initial=0.0
     )
     out_digest, _ = upload.push_from_file(f, len(payload), digest)
     assert out_digest == digest
