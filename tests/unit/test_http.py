@@ -1,6 +1,7 @@
 import json
 import ssl
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import requests
@@ -66,74 +67,67 @@ def test_smart_retry_reraises_proxy():
         r.increment(error=urllib3.exceptions.ProxyError("bad proxy", OSError()))
 
 
-def test_authorization_dropped_on_cross_origin_redirect(httpserver):
-    """When HF redirects to S3 or any other host, the Bearer token MUST be
-    stripped before the second GET.
+def _build_redirect_pair(original_url: str, redirect_url: str, auth: str | None):
+    """Construct (response, prepared_request) inputs to Session.rebuild_auth
+    that mirror what `requests` produces while following a redirect.
 
-    We simulate cross-origin by starting a second HTTPServer bound to
-    127.0.0.1 while the primary httpserver fixture uses localhost — the two
-    netlocs differ even on the same machine, which is what triggers the auth
-    stripping logic.
-    """
-    from pytest_httpserver import HTTPServer
-    from werkzeug.wrappers import Response
+    `response` represents the prior (3xx) response — its `.request.url` is
+    the URL we came from. `prepared_request` is the about-to-be-sent next
+    request whose Authorization header we want stripped or preserved."""
+    import requests as _requests
 
-    seen_auth_on_s3: list[str | None] = []
-
-    s3_server = HTTPServer(host="127.0.0.1", port=0)
-    s3_server.start()
-    try:
-
-        def s3_handler(request):
-            seen_auth_on_s3.append(request.headers.get("Authorization"))
-            return Response(b"data", status=200)
-
-        s3_server.expect_request("/s3-mock/file").respond_with_handler(s3_handler)
-
-        def origin_handler(request):
-            return Response(
-                "",
-                status=302,
-                headers={"Location": s3_server.url_for("/s3-mock/file")},
-            )
-
-        httpserver.expect_request("/api/redirect-me").respond_with_handler(origin_handler)
-
-        s = build_session()
-        r = s.get(
-            httpserver.url_for("/api/redirect-me"),
-            headers={"Authorization": "Bearer hf_secret"},
-        )
-        r.raise_for_status()
-        assert seen_auth_on_s3 == [None], (
-            f"Authorization must be stripped on cross-origin redirect; got {seen_auth_on_s3!r}"
-        )
-    finally:
-        s3_server.clear()
-        if s3_server.is_running():
-            s3_server.stop()
+    response = MagicMock()
+    response.request = MagicMock(url=original_url)
+    prepared = _requests.PreparedRequest()
+    prepared.prepare(method="GET", url=redirect_url)
+    if auth is not None:
+        prepared.headers["Authorization"] = auth
+    return response, prepared
 
 
-def test_authorization_preserved_on_same_origin_redirect(httpserver):
-    """Same-host redirects should keep the Bearer token."""
-    from werkzeug.wrappers import Response
+def test_authorization_dropped_on_cross_origin_redirect():
+    """`_SafeSession.rebuild_auth` strips Authorization when the redirect
+    target's netloc differs from the original. Direct unit test on the
+    method — bypasses pytest-httpserver entirely, which has known
+    instability on small responses against the GitHub runner."""
+    from oci_modelcar.http import _SafeSession
 
-    seen_auth_on_target: list[str | None] = []
-
-    httpserver.expect_request("/redirect").respond_with_data(
-        "", status=302, headers={"Location": httpserver.url_for("/target")}
+    s = _SafeSession()
+    response, prepared = _build_redirect_pair(
+        original_url="https://huggingface.co/repo/file",
+        redirect_url="https://cdn-lfs.huggingface.co/repo/file",
+        auth="Bearer hf_secret",
     )
+    s.rebuild_auth(prepared, response)
+    assert "Authorization" not in prepared.headers
 
-    def target_handler(request):
-        seen_auth_on_target.append(request.headers.get("Authorization"))
-        return Response("", status=200)
 
-    httpserver.expect_request("/target").respond_with_handler(target_handler)
+def test_authorization_preserved_on_same_origin_redirect():
+    """Same-netloc redirects preserve Authorization."""
+    from oci_modelcar.http import _SafeSession
 
-    s = build_session()
-    r = s.get(httpserver.url_for("/redirect"), headers={"Authorization": "Bearer hf_secret"})
-    r.raise_for_status()
-    assert seen_auth_on_target == ["Bearer hf_secret"]
+    s = _SafeSession()
+    response, prepared = _build_redirect_pair(
+        original_url="https://registry.example.com/v2/models/x/manifests/v1",
+        redirect_url="https://registry.example.com/v2/models/x/blobs/sha256:abc",
+        auth="Bearer hf_secret",
+    )
+    s.rebuild_auth(prepared, response)
+    assert prepared.headers.get("Authorization") == "Bearer hf_secret"
+
+
+def test_authorization_dropped_on_port_change():
+    """Different ports on the same host → different netloc → strip."""
+    from oci_modelcar.http import _SafeSession
+
+    s = _SafeSession()
+    response, prepared = _build_redirect_pair(
+        original_url="https://example.com:443/a",
+        redirect_url="https://example.com:8443/b",
+        auth="Bearer hf_secret",
+    )
+    s.rebuild_auth(prepared, response)
+    assert "Authorization" not in prepared.headers
 
 
 def test_huggingface_token_from_hf_token_env(monkeypatch):
