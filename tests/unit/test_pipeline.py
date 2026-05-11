@@ -8,8 +8,13 @@ import pytest
 from oci_modelcar.config import Config
 from oci_modelcar.download import HfFile
 from oci_modelcar.logging import PipelineLogger
-from oci_modelcar.manifest import ML_TAR, BlobDescriptor
-from oci_modelcar.pipeline import FileWorker, Pipeline
+from oci_modelcar.manifest import ANN_HF_PATH, ANN_HF_SHA256, ML_TAR, BlobDescriptor
+from oci_modelcar.pipeline import (
+    FileWorker,
+    Pipeline,
+    build_reuse_map,
+    fetch_manifest_at_tag,
+)
 
 
 def _build_worker(tmp_path: Path, head_blob_returns=None, **overrides):
@@ -65,6 +70,60 @@ def _build_worker(tmp_path: Path, head_blob_returns=None, **overrides):
         head_blob_mock,
         streaming_inst,
     )
+
+
+def test_file_worker_reuses_when_reuse_map_hits_and_blob_still_present(tmp_path, capsys):
+    """When (hf_path, hf_sha256) is in reuse_map and HEAD confirms the layer
+    blob is still in the registry, FileWorker returns the existing descriptor
+    without calling download, build_layer_to_file, or the streaming push."""
+    worker, downloader, head_blob_mock, streaming = _build_worker(tmp_path, head_blob_returns=None)
+    digest = "sha256:" + "a" * 64
+    existing_desc = BlobDescriptor(
+        media_type=ML_TAR, digest=digest, size=100, hf_path="m.bin", hf_sha256="1" * 64
+    )
+    worker.reuse_map = {("m.bin", "1" * 64): existing_desc}
+    head_blob_mock.side_effect = [{"digest": digest, "size": 100}]
+    plog = PipelineLogger(log_style="text", verbose=False, quiet=False)
+    worker.plog = plog
+
+    f = HfFile(path="m.bin", size=100, lfs_sha256="1" * 64)
+    desc = worker.process(repo="repo", revision="main", hf_file=f)
+
+    downloader.download.assert_not_called()
+    streaming.push_from_file.assert_not_called()
+    assert desc is existing_desc or (desc.digest == digest and desc.hf_path == "m.bin")
+    out = capsys.readouterr().out
+    assert "reusing" in out.lower() or "cached" in out.lower()
+
+
+def test_file_worker_reuse_map_miss_falls_through_to_download(tmp_path):
+    """If (hf_path, hf_sha256) is NOT in reuse_map, the normal download+push
+    path runs."""
+    worker, downloader, _head, streaming = _build_worker(tmp_path, head_blob_returns=None)
+    worker.reuse_map = {("OTHER.bin", "2" * 64): MagicMock()}
+    f = HfFile(path="m.bin", size=100, lfs_sha256="1" * 64)
+    worker.process(repo="repo", revision="main", hf_file=f)
+    downloader.download.assert_called_once()
+    streaming.push_from_file.assert_called_once()
+
+
+def test_file_worker_reuse_map_hit_but_blob_gone_falls_through(tmp_path):
+    """Reuse map says digest X exists, but HEAD returns 404 (blob was GC'd
+    in the registry). Worker must fall back to the normal download+push path."""
+    worker, downloader, head_blob_mock, streaming = _build_worker(tmp_path, head_blob_returns=None)
+    digest = "sha256:" + "a" * 64
+    desc = BlobDescriptor(
+        media_type=ML_TAR, digest=digest, size=100, hf_path="m.bin", hf_sha256="1" * 64
+    )
+    worker.reuse_map = {("m.bin", "1" * 64): desc}
+    # Reuse-precheck HEAD: 404 (gone). Then normal flow: skip-check after tar
+    # returns None (proceed), verify after push returns present.
+    head_blob_mock.side_effect = [None, None, {"digest": "sha256:" + "f" * 64, "size": 12345}]
+
+    f = HfFile(path="m.bin", size=100, lfs_sha256="1" * 64)
+    worker.process(repo="repo", revision="main", hf_file=f)
+    downloader.download.assert_called_once()
+    streaming.push_from_file.assert_called_once()
 
 
 def test_file_worker_emits_per_file_log_lines(tmp_path, capsys):
@@ -494,6 +553,76 @@ def test_pipeline_tag_conflict_no_force_raises(
     pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
     with pytest.raises(PushError, match="tag exists with different digest"):
         pipeline.run()
+
+
+def test_fetch_manifest_at_tag_returns_parsed_body_on_200() -> None:
+    client = MagicMock()
+    client.url.return_value = "http://r/v2/m/x/manifests/tag"
+    client.auth = {"Authorization": "x"}
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "schemaVersion": 2,
+        "layers": [
+            {
+                "mediaType": ML_TAR,
+                "digest": "sha256:" + "a" * 64,
+                "size": 100,
+                "annotations": {ANN_HF_PATH: "m.bin", ANN_HF_SHA256: "1" * 64},
+            },
+        ],
+    }
+    client.session.get.return_value = resp
+    out = fetch_manifest_at_tag(client, "m/x", "tag")
+    assert out is not None and out["layers"][0]["digest"] == "sha256:" + "a" * 64
+
+
+def test_fetch_manifest_at_tag_returns_none_on_404() -> None:
+    client = MagicMock()
+    client.url.return_value = "http://r/v2/m/x/manifests/missing"
+    client.auth = {}
+    resp = MagicMock()
+    resp.status_code = 404
+    client.session.get.return_value = resp
+    assert fetch_manifest_at_tag(client, "m/x", "missing") is None
+
+
+def test_build_reuse_map_indexes_layers_by_hf_path_and_sha256() -> None:
+    manifest = {
+        "layers": [
+            {
+                "mediaType": ML_TAR,
+                "digest": "sha256:" + "a" * 64,
+                "size": 100,
+                "annotations": {ANN_HF_PATH: "model.safetensors", ANN_HF_SHA256: "1" * 64},
+            },
+            {
+                "mediaType": ML_TAR,
+                "digest": "sha256:" + "b" * 64,
+                "size": 50,
+                "annotations": {ANN_HF_PATH: "config.json"},  # no LFS sha
+            },
+        ],
+    }
+    reuse = build_reuse_map(manifest)
+    assert ("model.safetensors", "1" * 64) in reuse
+    assert ("config.json", None) in reuse
+    desc_a = reuse[("model.safetensors", "1" * 64)]
+    assert desc_a.digest == "sha256:" + "a" * 64
+    assert desc_a.size == 100
+    assert desc_a.hf_path == "model.safetensors"
+    assert desc_a.hf_sha256 == "1" * 64
+
+
+def test_build_reuse_map_skips_layers_without_path_annotation() -> None:
+    """A manifest produced by an older oci-modelcar run (pre-annotations) is
+    silently ignored — we have no way to associate its layers with hf paths."""
+    manifest = {
+        "layers": [
+            {"mediaType": ML_TAR, "digest": "sha256:" + "a" * 64, "size": 100},
+        ],
+    }
+    assert build_reuse_map(manifest) == {}
 
 
 def test_pipeline_tag_conflict_with_force_overwrites(

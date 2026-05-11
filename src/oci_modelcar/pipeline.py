@@ -19,6 +19,8 @@ from oci_modelcar.errors import ConfigError, DiskSpaceError, PartialFailureError
 from oci_modelcar.layer import build_layer_to_file, tar_layer_size
 from oci_modelcar.logging import PipelineLogger, ProgressEmitter, fmt_bytes
 from oci_modelcar.manifest import (
+    ANN_HF_PATH,
+    ANN_HF_SHA256,
     ML_MAN,
     ML_TAR,
     BlobDescriptor,
@@ -55,6 +57,7 @@ class FileWorker:
         stop_event: threading.Event | None = None,
         plog: PipelineLogger | None = None,
         progress_interval: float = 5.0,
+        reuse_map: dict[tuple[str, str | None], BlobDescriptor] | None = None,
     ) -> None:
         self.downloader = downloader
         self.registry_client = registry_client
@@ -68,6 +71,7 @@ class FileWorker:
         self.stop_event = stop_event
         self.plog = plog
         self.progress_interval = progress_interval
+        self.reuse_map = reuse_map or {}
 
     def _say(self, msg: str) -> None:
         if self.plog is not None:
@@ -82,6 +86,20 @@ class FileWorker:
     ) -> BlobDescriptor:
         if self.stop_event is not None and self.stop_event.is_set():
             raise InterruptedError(f"worker for {hf_file.path} aborted before start")
+
+        # 0. REUSE PRE-CHECK — if the previous manifest at the target tag
+        # already carries a layer for this (hf_path, hf_sha256) and that
+        # blob is still in the registry, skip the whole download+tar+push.
+        reuse_hit = self.reuse_map.get((hf_file.path, hf_file.lfs_sha256))
+        if reuse_hit is not None:
+            target_repo = self._target_repo()
+            present = self.head_blob_fn(self.registry_client, target_repo, reuse_hit.digest)
+            if present is not None:
+                self._say(
+                    f"{hf_file.path}: reusing cached layer {reuse_hit.digest[:19]} "
+                    f"({fmt_bytes(reuse_hit.size)}) — HF skipped"
+                )
+                return reuse_hit
 
         # a. DOWNLOAD
         self._say(f"{hf_file.path}: downloading ({fmt_bytes(hf_file.size)})")
@@ -193,6 +211,48 @@ def get_manifest_digest_at_tag(client: OciClient, repo: str, tag: str) -> str | 
     return digest if digest else None
 
 
+def fetch_manifest_at_tag(client: OciClient, repo: str, tag: str) -> dict[str, Any] | None:
+    """GET the manifest at `tag`; return the parsed JSON or None on 404."""
+    url = client.url(repo, "manifests", tag)
+    r = client.session.get(
+        url,
+        headers={**client.auth, "Accept": ML_MAN},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        r.raise_for_status()
+    body: dict[str, Any] = r.json()
+    return body
+
+
+def build_reuse_map(
+    manifest: dict[str, Any],
+) -> dict[tuple[str, str | None], BlobDescriptor]:
+    """Index a manifest's layers by (hf-path, hf-sha256) for reuse on re-push.
+
+    Layers without the hf-path annotation (older oci-modelcar runs, foreign
+    images) are silently skipped — without the path we can't map them to an
+    HF file in the current run.
+    """
+    out: dict[tuple[str, str | None], BlobDescriptor] = {}
+    for layer in manifest.get("layers", []) or []:
+        annotations = layer.get("annotations") or {}
+        path = annotations.get(ANN_HF_PATH)
+        if not path:
+            continue
+        sha = annotations.get(ANN_HF_SHA256)
+        out[(path, sha)] = BlobDescriptor(
+            media_type=layer.get("mediaType", ML_TAR),
+            digest=layer["digest"],
+            size=int(layer["size"]),
+            hf_path=path,
+            hf_sha256=sha,
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -268,6 +328,18 @@ class Pipeline:
         existing_tag_digest = get_manifest_digest_at_tag(
             self.registry_client, self.cfg.target_repo, target_tag
         )
+        reuse_map: dict[tuple[str, str | None], BlobDescriptor] = {}
+        if existing_tag_digest is not None and not self.cfg.force:
+            existing_manifest = fetch_manifest_at_tag(
+                self.registry_client, self.cfg.target_repo, target_tag
+            )
+            if existing_manifest is not None:
+                reuse_map = build_reuse_map(existing_manifest)
+                if reuse_map:
+                    self.plog.info(
+                        f"reuse: {len(reuse_map)} layer(s) annotated in existing manifest "
+                        f"at {target_tag!r}"
+                    )
         self._check_disk_space(files)
 
         if self.cfg.dry_run:
@@ -297,6 +369,7 @@ class Pipeline:
                 oci_max_retries=self.cfg.oci_max_retries,
                 stop_event=stop_event,
                 plog=self.plog,
+                reuse_map=reuse_map,
             )
 
         descriptors: list[BlobDescriptor] = []
