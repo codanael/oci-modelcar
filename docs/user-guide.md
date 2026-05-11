@@ -29,12 +29,15 @@ high-level overview see [README.md](../README.md).
    target tag, check the registry for an existing manifest at that tag,
    verify free disk space.
 2. **Per-file pipeline** — for each matched HF file, run a worker that:
-   downloads the file to a local spool directory, builds an uncompressed
-   tar layer with deterministic headers, HEADs the registry to skip if
-   the blob is already present, otherwise pushes the layer in a single
-   streaming PATCH from the local file (Jib-style, with full-PATCH replay
-   on a TCP cut), then HEAD-confirms and cleans up the tar. Workers run
-   in parallel via `--workers`.
+   first does a phase-0 reuse pre-check (if a previous run annotated this
+   file's `(hf-path, hf-sha256)` on a layer in the existing manifest and
+   that layer is still HEAD-able, return the existing descriptor and skip
+   everything else); otherwise downloads the file to a local spool
+   directory, builds an uncompressed tar layer with deterministic headers,
+   HEADs the registry to skip if the blob is already present, otherwise
+   pushes the layer in a single streaming PATCH from the local file
+   (Jib-style, with full-PATCH replay on a TCP cut), then HEAD-confirms
+   and cleans up the tar. Workers run in parallel via `--workers`.
 3. **Manifest** — once all blobs are present, build the OCI image config
    from the collected `diff_id`s, push the config blob, build and push
    the manifest under the target tag plus any `--also-tag`s, validate
@@ -104,12 +107,26 @@ Output:
 HF repo  : Qwen/Qwen2.5-7B-Instruct
 Revision : a3f47b09c8d2e9f5b7a8c3d4e5f6789012345678
 8 files matched
+config.json: downloading (612 B)
+config.json: pushing layer sha256:8f3e2c1a4b5d (1.0 KB)
+config.json: pushed sha256:8f3e2c1a4b5d
+model-00001-of-00002.safetensors: downloading (4.9 GB)
+model-00001-of-00002.safetensors: 21% (1.0 GB / 4.9 GB)
+model-00001-of-00002.safetensors: 41% (2.0 GB / 4.9 GB)
+…
+model-00001-of-00002.safetensors: pushing layer sha256:1a2b3c4d5e6f (4.9 GB)
+model-00001-of-00002.safetensors: pushed sha256:1a2b3c4d5e6f
+…
 manifest: sha256:cafef00d...
 image:    registry.acme.com/models/qwen-7b:a3f47b09c8d2
 manifestDigest=sha256:cafef00d...
 imageRef=registry.acme.com/models/qwen-7b:a3f47b09c8d2
 imageRefDigest=registry.acme.com/models/qwen-7b@sha256:cafef00d...
 ```
+
+A re-push of the same revision short-circuits the per-file pipeline via
+the reuse pre-check, replacing each `downloading … pushed` pair with a
+single `reusing cached layer sha256:… (… ) — HF skipped` line.
 
 The image tag defaults to the first 12 characters of the resolved HF
 commit SHA. Override with `--target-tag`.
@@ -305,18 +322,37 @@ is the key invariant that handles Artifactory HA cluster + load balancer
 without sticky session affinity: each PATCH = new TCP request = new LB
 routing decision = entire blob lands on one node.
 
-### Resume after partial failure
+### Resume after partial failure / cross-run reuse
 
-If the push is killed mid-way (`Ctrl+C`, OOM, network outage), re-run
-the *exact same command*. The pre-flight will:
+If the push is killed mid-way (`Ctrl+C`, OOM, network outage) — or if you
+simply re-push the same model later — re-run the *exact same command*.
+Three layers of skipping kick in, in order:
 
-- Skip the job entirely if the manifest tag already points to the
-  expected digest
-- Otherwise, for each file, the worker's HEAD-blob check skips files
-  whose digest is already present in the registry
+1. **Tag match short-circuit.** If the manifest tag already points to the
+   digest we'd produce, the whole job is skipped.
+2. **Annotation-driven layer reuse (the cross-run accelerator).** Each
+   layer descriptor we push carries two annotations:
+   - `io.github.codanael.modelcar.hf-path: <hf_path>`
+   - `io.github.codanael.modelcar.hf-sha256: <hex>` (only when the HF
+     file is LFS-backed)
 
-Force a full re-push (ignoring HEAD-blob skips) with `--force`. This
-also overwrites the existing manifest tag.
+   On every push, the pipeline GETs the existing manifest at the target
+   tag and indexes its layers by `(hf-path, hf-sha256)`. For each HF file
+   in the new run, if `(file.path, file.lfs_sha256)` is in that index AND
+   a HEAD-blob confirms the layer is still in the registry, the worker
+   skips the HF download, the tar build, AND the PATCH entirely — only
+   one HEAD per layer is issued. This is what makes a re-push of an
+   unchanged HF revision touch HF for zero bytes.
+3. **Same-run blob skip.** When the reuse map misses (file changed, or
+   first push), the worker builds the tar locally as usual but still
+   HEADs the freshly-computed layer digest and skips the PATCH if the
+   registry already has it. Combined with the cached spool sources
+   (`<spool>/sources/<path>` is reused without re-download if it exists
+   at the expected size), this turns a killed-mid-way push into a
+   near-instant completion on the next run.
+
+`--force` bypasses all three layers: the reuse map is not built, HEAD
+checks are ignored, and the existing manifest tag is overwritten.
 
 ### Mid-stream cancellation
 

@@ -109,22 +109,37 @@ use plain HTTP. Pass an explicit `http://` or `https://` prefix on
 Full list: `oci-modelcar push --help`. For complete usage, scenarios, and
 troubleshooting see [docs/user-guide.md](./docs/user-guide.md).
 
-## Resume after failure
+## Resume after failure / re-push
 
-v1 uses the registry as the source of truth. If a push is killed mid-way,
-re-running the same command skips blobs that are already present (HEAD check).
-No local state file is needed.
+v1 uses the registry as the source of truth. No local state file is needed.
+
+Two layers of skipping kick in on a re-run:
+
+1. **Cross-run reuse (no HF traffic).** Every layer is annotated with the
+   HuggingFace path and (for LFS files) the upstream sha256. On every push,
+   the pipeline GETs the existing manifest at the target tag, indexes its
+   layers by `(hf-path, hf-sha256)`, and for each unchanged file skips the
+   HF download + tar build + PATCH entirely — only a HEAD-blob is issued
+   to confirm the layer is still in the registry. A re-push of an unchanged
+   HF revision touches HF for zero bytes.
+2. **Same-run blob skip (resume after crash).** Even when the reuse map
+   misses, the worker still HEADs each freshly-built layer digest and skips
+   the PUT if the registry already has the blob. Combined with the cached
+   spool sources (`<spool>/sources/<path>` is reused if it exists at the
+   expected size), this turns a killed-mid-way push into a near-instant
+   completion on the next run.
 
 ```bash
 # First run, killed mid-way
 oci-modelcar push --hf-repo X --registry Y --target-repo Z
 # ^C
 
-# Re-run: blobs already in the registry are skipped
+# Re-run: cached files + cached blobs picked up, only the missing pieces transfer
 oci-modelcar push --hf-repo X --registry Y --target-repo Z
 ```
 
-Force a full re-push (ignoring HEAD results) with `--force`.
+`--force` bypasses both layers (reuse map is not built, HEAD checks are
+ignored on blobs and on the manifest tag).
 
 ## OCI compliance
 
