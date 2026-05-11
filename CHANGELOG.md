@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.2.0] - 2026-05-11
 
 ### Added
 - **Crash-resilient reuse via OCI 1.1 referrer artifacts.** A run that
@@ -13,15 +13,17 @@ All notable changes to this project will be documented in this file.
   stub manifest whose digest is a pure function of
   `(hf_repo, hf_revision, allow_patterns, ignore_patterns, layer_prefix)`.
   On resume the pipeline queries the OCI referrers API
-  (`GET /v2/<repo>/referrers/<anchor_digest>`) — natively on Artifactory
-  ≥ 7.90.1 and `registry:2` ≥ 2.8, or via the spec-defined
-  `sha256-<hex>` fallback tag schema on older registries (detected at
-  runtime via the `OCI-Subject` response header). Reuse records map
-  `(hf_path, hf_sha256) → layer_digest`, so the resume run rebuilds
-  the manifest with zero HF traffic and zero blob re-push. The
-  pre-existing v1.1 manifest-based reuse-map is still consulted and
-  wins on key collision (more authoritative — backed by a successful
-  final manifest).
+  (`GET /v2/<repo>/referrers/<anchor_digest>`) natively on registries
+  that support OCI 1.1 (Artifactory ≥ 7.90.1, zot, Amazon ECR, GHCR),
+  or falls back to the spec-defined `sha256-<hex>` tag schema on
+  registries that don't (notably `distribution/distribution` v2.x and
+  v3.x, whose referrers proposal #3716 is still open upstream).
+  Detection is via the `OCI-Subject` response header on the first
+  record PUT. Reuse records map `(hf_path, hf_sha256) → layer_digest`,
+  so the resume run rebuilds the manifest with zero HF traffic and
+  zero blob re-push. The pre-existing v1.1 manifest-based reuse-map
+  is still consulted and wins on key collision (more authoritative —
+  backed by a successful final manifest).
 - **`--no-reuse-records` opt-out.** Disables writing the referrer
   artifacts described above. Documented as a corner-case escape hatch
   for users who want a registry repo clean of metadata artifacts or
