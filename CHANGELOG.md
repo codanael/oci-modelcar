@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Per-file progress restored.** `FileWorker` now announces each phase of
+  the pipeline via `PipelineLogger`:
+  `<path>: downloading (NN MB)`, throttled `NN% (transferred / total)`
+  lines, `<path>: pushing layer sha256:abc12 (NN MB)`, and a closing
+  `<path>: pushed sha256:abc12` (or `: reusing existing blob …`). The
+  v0.x `ProgressEmitter` and human-bytes scaler `fmt_bytes` are back, and
+  `PipelineLogger` emits are now mutex-guarded so parallel workers do not
+  interleave lines. Restores the live status output that was dropped in
+  the v1.0 rewrite.
+- **Cross-run layer reuse via manifest annotations.** Each layer descriptor
+  now carries `io.github.codanael.modelcar.hf-path` (always) and
+  `io.github.codanael.modelcar.hf-sha256` (for LFS-backed files) in its
+  `annotations`. On every `push`, the pipeline fetches the existing
+  manifest at the target tag (when present and `--force` is off), parses
+  these annotations into a reuse-map keyed by `(hf_path, hf_sha256)`, and
+  hands it to every worker. When a file's `(path, lfs_sha256)` matches a
+  reuse-map entry and the layer blob is still present in the registry,
+  the worker skips HF download + tar build + push entirely and reuses the
+  existing descriptor as-is. A re-push of an unchanged HuggingFace
+  revision now touches HF for zero bytes and the registry for HEAD-only
+  traffic.
+
+### Fixed
+- **`download.py` now actually honors the cached-source guarantee**
+  promised in `CLAUDE.md`. If `<spool>/sources/<hf_path>` already exists
+  at the expected size (atomic-rename invariant: it's the completed,
+  sha256-verified result of a prior run), `HfDownloader.download()`
+  returns the cached path without issuing any HTTP request, instead of
+  silently re-downloading on every invocation. Mainly benefits crashed-run
+  retries when `--clean-hf-after-push` is off.
+
 ## [1.0.1] - 2026-05-10
 
 ### Fixed

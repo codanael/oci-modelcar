@@ -164,6 +164,19 @@ explaining why in the PR.
 - **Registry HEAD is the source of truth for resumability.** No local state
   file (`state.json` was removed in v1.0). Blobs already present in the
   registry are detected via HEAD check and skipped. `--force` bypasses HEAD.
+- **Layer annotations `modelcar.hf-path` + `modelcar.hf-sha256` are
+  load-bearing** for cross-run reuse. They are written by `manifest.py`
+  (`ANN_HF_PATH` / `ANN_HF_SHA256`) and read back by
+  `pipeline.py:build_reuse_map`. Without them, a re-push cannot match a
+  remote layer to the local file being processed and would re-download
+  everything. Keep them sorted-keys JSON so the manifest digest stays
+  deterministic. The reverse-DNS namespace is `io.github.codanael.modelcar.*`
+  per OCI annotation conventions.
+- **Reuse skip happens BEFORE HF download.** `FileWorker.process` phase 0
+  looks up `(hf_file.path, hf_file.lfs_sha256)` in the reuse-map; on hit
+  it HEADs the layer blob to confirm the registry still has it, then
+  returns the existing `BlobDescriptor` without any HF or local disk
+  traffic. `--force` short-circuits the reuse-map build in `Pipeline.run`.
 - **CLI uses argparse sub-commands** (`push`, `status`, `validate`) dispatched
   by `cli.py:main`. `Config` has its own parser scoped to `push` arguments.
   Don't collapse sub-commands into `argv[0]` dispatch (reverted from v0.x).
