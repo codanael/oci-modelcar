@@ -77,6 +77,16 @@ def head_blob(client: OciClient, repo: str, digest: str) -> dict[str, object] | 
     return {"digest": digest, "size": cl}
 
 
+def _resolve_upload_location(client: OciClient, location: str) -> str:
+    """OCI Distribution allows the Location header from POST blobs/uploads/
+    to be either absolute (distribution/distribution) or a path-only
+    relative URL (zot). Resolve relative paths against the client's base.
+    """
+    if location.startswith(("http://", "https://")):
+        return location
+    return f"{client.base}{location}"
+
+
 def push_small_blob(client: OciClient, repo: str, data: bytes) -> str:
     """Monolithic POST + PUT for small blobs (config). Returns digest."""
     digest = "sha256:" + hashlib.sha256(data).hexdigest()
@@ -86,7 +96,7 @@ def push_small_blob(client: OciClient, repo: str, data: bytes) -> str:
     r = client.session.post(init_url, headers=client.auth, timeout=30)
     if r.status_code != 202:
         r.raise_for_status()
-    loc = r.headers["Location"]
+    loc = _resolve_upload_location(client, r.headers["Location"])
     sep = "&" if "?" in loc else "?"
     hdr = {
         **client.auth,
@@ -153,7 +163,7 @@ class StreamingBlobUpload:
         loc = r.headers.get("Location")
         if not loc:
             raise RuntimeError("upload init missing Location header")
-        return loc
+        return _resolve_upload_location(self.client, loc)
 
     def push_from_file(self, tar_path: Path, total_size: int, digest: str) -> tuple[str, int]:
         """POST init → PATCH from file (full replay on cut) → PUT close.
@@ -193,7 +203,9 @@ class StreamingBlobUpload:
                         location, data=body, headers=hdr, timeout=(30, 600)
                     )
                 if r.status_code in (200, 201, 202, 204):
-                    location = r.headers.get("Location", location)
+                    new_loc = r.headers.get("Location")
+                    if new_loc:
+                        location = _resolve_upload_location(self.client, new_loc)
                     success = True
                     break
                 if r.status_code in (404, 408, 429) or 500 <= r.status_code < 600:

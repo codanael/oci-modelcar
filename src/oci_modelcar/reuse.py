@@ -168,17 +168,28 @@ class RegistryReuseStore:
     def load_reuse_map(self, anchor_digest: str) -> dict[tuple[str, str | None], BlobDescriptor]:
         """Return ``(hf_path, hf_sha256) → BlobDescriptor`` from records.
 
-        Tries the native referrers API first, falls back to the OCI 1.1
-        tag schema (``<algo>-<hex>``) on 404. Missing or malformed
-        records are silently skipped.
+        Reads BOTH the native referrers API and the OCI 1.1 fallback tag
+        and unions the descriptors. We can't assume which path our prior
+        run used: a registry that supports native referrers GET but does
+        not echo ``OCI-Subject`` on PUT (e.g. zot in some versions) ends
+        up with records in the fallback tag even though the native
+        endpoint exists. Cost: at most 2 GETs per pipeline run, both
+        tiny. Missing or malformed records are silently skipped.
         """
-        index = self._fetch_referrers_index(anchor_digest)
-        if index is None:
-            return {}
-        descriptors_raw = index.get("manifests")
+        seen_record_digests: set[str] = set()
         descriptors: list[dict[str, object]] = []
-        if isinstance(descriptors_raw, list):
-            descriptors = [d for d in descriptors_raw if isinstance(d, dict)]
+        for index in self._fetch_indices(anchor_digest):
+            descriptors_raw = index.get("manifests")
+            if not isinstance(descriptors_raw, list):
+                continue
+            for desc in descriptors_raw:
+                if not isinstance(desc, dict):
+                    continue
+                digest = desc.get("digest")
+                if isinstance(digest, str) and digest not in seen_record_digests:
+                    seen_record_digests.add(digest)
+                    descriptors.append(desc)
+
         out: dict[tuple[str, str | None], BlobDescriptor] = {}
         for desc in descriptors:
             digest = desc.get("digest")
@@ -193,7 +204,17 @@ class RegistryReuseStore:
             out[(entry.hf_path, entry.hf_sha256)] = entry
         return out
 
-    def _fetch_referrers_index(self, anchor_digest: str) -> dict[str, object] | None:
+    def _fetch_indices(self, anchor_digest: str) -> list[dict[str, object]]:
+        """Yield every referrer-index source we can find for this anchor.
+
+        Order: native referrers API, then fallback tag. We always check
+        both because the registry's PUT echo behavior (whether it sent
+        ``OCI-Subject`` during the originating run) determines which
+        index actually holds the records, and we can't assume it.
+        """
+        out: list[dict[str, object]] = []
+
+        # Native referrers API
         url = self.client.url(self.repo, "referrers", anchor_digest)
         url = f"{url}?artifactType={ARTIFACT_TYPE_RECORD}"
         r = self.client.session.get(
@@ -203,10 +224,11 @@ class RegistryReuseStore:
         )
         if r.status_code == 200:
             body: dict[str, object] = r.json()
-            return body
-        if r.status_code != 404:
+            out.append(body)
+        elif r.status_code != 404:
             r.raise_for_status()
-        # Native unsupported — try the OCI 1.1 fallback tag schema.
+
+        # Fallback tag
         tag = fallback_referrers_tag(anchor_digest)
         url = self.client.url(self.repo, "manifests", tag)
         r = self.client.session.get(
@@ -214,12 +236,12 @@ class RegistryReuseStore:
             headers={**self.client.auth, "Accept": ML_INDEX},
             timeout=30,
         )
-        if r.status_code == 404:
-            return None
-        if r.status_code != 200:
+        if r.status_code == 200:
+            out.append(r.json())
+        elif r.status_code != 404:
             r.raise_for_status()
-        body = r.json()
-        return body
+
+        return out
 
     def _fetch_manifest_json(self, reference: str) -> dict[str, object] | None:
         url = self.client.url(self.repo, "manifests", reference)
