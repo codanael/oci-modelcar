@@ -15,6 +15,7 @@ from oci_modelcar.http import build_session
 from oci_modelcar.logging import PipelineLogger
 from oci_modelcar.pipeline import Pipeline
 from oci_modelcar.registry import OciClient, head_blob
+from oci_modelcar.reuse import RegistryReuseStore
 
 log = logging.getLogger(__name__)
 
@@ -72,11 +73,17 @@ def _run_push(argv: list[str]) -> int:
         target_repo=cfg.target_repo,
         session=session,
     )
+    reuse_store = (
+        None
+        if cfg.no_reuse_records
+        else RegistryReuseStore(client=registry_client, repo=cfg.target_repo)
+    )
     pipeline = Pipeline(
         cfg=cfg,
         plog=plog,
         downloader=downloader,
         registry_client=registry_client,
+        reuse_store=reuse_store,
     )
     try:
         pipeline.run()

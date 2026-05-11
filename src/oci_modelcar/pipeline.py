@@ -36,6 +36,7 @@ from oci_modelcar.registry import (
     push_small_blob,
     validate_manifest_tag,
 )
+from oci_modelcar.reuse import RegistryReuseStore, build_anchor_manifest_bytes
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class FileWorker:
         plog: PipelineLogger | None = None,
         progress_interval: float = 5.0,
         reuse_map: dict[tuple[str, str | None], BlobDescriptor] | None = None,
+        reuse_store: RegistryReuseStore | None = None,
+        anchor_digest: str | None = None,
+        anchor_size: int = 0,
     ) -> None:
         self.downloader = downloader
         self.registry_client = registry_client
@@ -72,6 +76,9 @@ class FileWorker:
         self.plog = plog
         self.progress_interval = progress_interval
         self.reuse_map = reuse_map or {}
+        self.reuse_store = reuse_store
+        self.anchor_digest = anchor_digest
+        self.anchor_size = anchor_size
 
     def _say(self, msg: str) -> None:
         if self.plog is not None:
@@ -155,13 +162,18 @@ class FileWorker:
                 )
 
             self._say(f"{hf_file.path}: pushed {digest[:19]}")
-            return BlobDescriptor(
+            descriptor = BlobDescriptor(
                 media_type=ML_TAR,
                 digest=digest,
                 size=layer_size,
                 hf_path=hf_file.path,
                 hf_sha256=hf_file.lfs_sha256,
             )
+            # v1.3: write a reuse-record artifact so a crash before the
+            # final manifest doesn't orphan this blob from future runs.
+            if self.reuse_store is not None and self.anchor_digest is not None:
+                self.reuse_store.record(descriptor, self.anchor_digest, self.anchor_size)
+            return descriptor
         finally:
             # f. CLEANUP — always remove tar; remove source if configured
             with contextlib.suppress(FileNotFoundError):
@@ -265,11 +277,13 @@ class Pipeline:
         plog: PipelineLogger,
         downloader: HfDownloader | None = None,
         registry_client: OciClient | None = None,
+        reuse_store: RegistryReuseStore | None = None,
     ) -> None:
         self.cfg = cfg
         self.plog = plog
         self._downloader = downloader
         self._registry_client = registry_client
+        self._reuse_store = reuse_store
 
     @property
     def downloader(self) -> HfDownloader:
@@ -331,21 +345,55 @@ class Pipeline:
 
     def run(self) -> RunResult:
         revision, files, target_tag = self._preflight()
+
+        # v1.3: anchor + referrer reuse-records. Survives crashes before
+        # the final manifest is committed. Active only when a reuse_store
+        # is provided (CLI wires a real one; unit tests opt out by leaving
+        # it None to avoid hitting registry helpers via mocks).
+        anchor_digest: str | None = None
+        anchor_size = 0
+        referrer_reuse_map: dict[tuple[str, str | None], BlobDescriptor] = {}
+        if self._reuse_store is not None:
+            anchor_bytes = build_anchor_manifest_bytes(
+                hf_repo=self.cfg.hf_repo,
+                hf_revision=revision,
+                allow_patterns=self.cfg.allow_patterns,
+                ignore_patterns=self.cfg.ignore_patterns,
+                layer_prefix=self.cfg.layer_prefix,
+            )
+            anchor_digest = "sha256:" + hashlib.sha256(anchor_bytes).hexdigest()
+            anchor_size = len(anchor_bytes)
+            if not self.cfg.force:
+                self._reuse_store.ensure_anchor(anchor_bytes, anchor_digest)
+                referrer_reuse_map = self._reuse_store.load_reuse_map(anchor_digest)
+                if referrer_reuse_map:
+                    self.plog.info(
+                        f"reuse: {len(referrer_reuse_map)} layer(s) found via referrer records"
+                    )
+
+        # v1.1: manifest-based reuse map (target-tag manifest)
         existing_tag_digest = get_manifest_digest_at_tag(
             self.registry_client, self.cfg.target_repo, target_tag
         )
-        reuse_map: dict[tuple[str, str | None], BlobDescriptor] = {}
+        manifest_reuse_map: dict[tuple[str, str | None], BlobDescriptor] = {}
         if existing_tag_digest is not None and not self.cfg.force:
             existing_manifest = fetch_manifest_at_tag(
                 self.registry_client, self.cfg.target_repo, target_tag
             )
             if existing_manifest is not None:
-                reuse_map = build_reuse_map(existing_manifest)
-                if reuse_map:
+                manifest_reuse_map = build_reuse_map(existing_manifest)
+                if manifest_reuse_map:
                     self.plog.info(
-                        f"reuse: {len(reuse_map)} layer(s) annotated in existing manifest "
-                        f"at {target_tag!r}"
+                        f"reuse: {len(manifest_reuse_map)} layer(s) annotated in existing "
+                        f"manifest at {target_tag!r}"
                     )
+
+        # Merge: v1.1 wins on collision (more authoritative — came from a
+        # successful final manifest, not a possibly-partial run).
+        reuse_map: dict[tuple[str, str | None], BlobDescriptor] = {
+            **referrer_reuse_map,
+            **manifest_reuse_map,
+        }
         self._check_disk_space(files)
 
         if self.cfg.dry_run:
@@ -376,6 +424,9 @@ class Pipeline:
                 stop_event=stop_event,
                 plog=self.plog,
                 reuse_map=reuse_map,
+                reuse_store=self._reuse_store,
+                anchor_digest=anchor_digest,
+                anchor_size=anchor_size,
             )
 
         descriptors: list[BlobDescriptor] = []

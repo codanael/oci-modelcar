@@ -147,6 +147,7 @@ running with `--log-style azure` (see [CI/CD integration](#cicd-integration)).
 | `--hf-endpoint <url>` | `HF_ENDPOINT` | `https://huggingface.co` | Override for HF mirrors / proxies |
 | `--allow-patterns <pat...>` | `ALLOW_PATTERNS` | `.safetensors .json .txt .md .model` | Space-separated patterns; only matching files are pulled. Bare tokens (`.safetensors`) act as suffix filters; tokens with `*`, `?`, or `[…]` are full `fnmatch` globs on the repo path. |
 | `--ignore-patterns <pat...>` | `IGNORE_PATTERNS` | empty | Space-separated patterns to exclude after `--allow-patterns` admits. Same syntax. Wins over `--allow-patterns` when both match. |
+| `--no-reuse-records` | `NO_REUSE_RECORDS` | off | Don't write OCI referrer artifacts for crash-resilient reuse. Corner-case escape hatch (see "Resume after crash mid-push" below). |
 
 ### Target (OCI registry)
 
@@ -399,6 +400,49 @@ Three layers of skipping kick in, in order:
 
 `--force` bypasses all three layers: the reuse map is not built, HEAD
 checks are ignored, and the existing manifest tag is overwritten.
+
+### Resume after crash mid-push (referrer reuse records)
+
+The reuse mechanism above reads annotations from the **final manifest**
+at the target tag. That works for any successful prior push. But if a
+push crashes after some layer blobs are uploaded yet **before** the
+final manifest is committed — and `--clean-hf-after-push` has deleted
+the spool sources — the prior run's mapping is gone: blobs are in the
+registry but orphaned, and the next run re-downloads from HF.
+
+To close that gap, the pipeline writes one **OCI referrer artifact**
+per layer, anchored on a deterministic stub manifest:
+
+- The stub's digest is a pure function of
+  `(hf_repo, hf_revision, allow_patterns, ignore_patterns, layer_prefix)`,
+  so every run with identical inputs targets the same anchor.
+- Each per-layer "reuse record" is a ~1 KB manifest carrying the
+  `(hf-path, hf-sha256, layer_digest)` triple, with `subject` pointing
+  at the anchor.
+- After a crash, the next run computes the same anchor, queries
+  `GET /v2/<repo>/referrers/<anchor_digest>` to retrieve every record,
+  and seeds its reuse-map from them.
+
+The OCI 1.1 referrers API is natively supported by Artifactory
+≥ 7.90.1 and `registry:2` ≥ 2.8. On older registries the client
+maintains the spec-defined fallback tag `sha256-<hex>` automatically;
+detection is via the `OCI-Subject` response header on the first record
+PUT.
+
+Use `--no-reuse-records` to disable this entirely (corner-case
+opt-out: registries that mishandle unknown `artifactType`s, or
+operators who want the repo clean of metadata artifacts).
+
+Inspect the records of a run:
+
+```bash
+# Native referrers API (modern Artifactory / registry:2)
+oras discover --output json registry.example.com/models/mistral-medium-3.5:sha[:12]
+
+# Or via the anchor digest, if you know it
+curl -sH 'Accept: application/vnd.oci.image.index.v1+json' \
+  https://registry.example.com/v2/models/mistral-medium-3.5/referrers/<anchor_digest>
+```
 
 ### Mid-stream cancellation
 
