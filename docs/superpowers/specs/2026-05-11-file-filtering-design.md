@@ -179,10 +179,17 @@ oci-modelcar push \
   --hf-repo mistralai/Mistral-Medium-3.5-128B \
   --registry registry.example.com \
   --target-repo models/mistral-medium-3.5 \
-  --ignore-patterns "consolidated-*" "params.json" "images/*"
+  --ignore-patterns "consolidated*" "params.json" "images/*"
 ```
 
-Resulting file set (∼134 GB instead of ∼267 GB):
+Note `consolidated*` (no hyphen): the Mistral native layout includes
+both `consolidated-00001-of-00003.safetensors` (hyphen prefix) and
+`consolidated.safetensors.index.json` (dot prefix), so a hyphen-only
+glob leaks the index file. `consolidated*` catches both with one
+pattern.
+
+Resulting file set under the default `--allow-patterns` (~134 GB
+instead of ~267 GB):
 
 ```
 model-00001-of-00003.safetensors      49.8 GB
@@ -194,10 +201,15 @@ generation_config.json                131 B
 tokenizer.json                        17.1 MB
 tokenizer_config.json                 21.2 KB
 processor_config.json                 660 B
-chat_template.jinja                   13.5 KB
 tekken.json                           16.3 MB
-README.md, SYSTEM_PROMPT.txt          (docs)
+README.md                             21.9 KB
+SYSTEM_PROMPT.txt                     1.46 KB
 ```
+
+`chat_template.jinja`, `LICENSE`, and `.gitattributes` are excluded by
+the **default** `--allow-patterns` (no `.jinja` / extensionless
+support). If your serving stack needs the chat template, add `.jinja`
+to `--allow-patterns`.
 
 To push only the Mistral native layout instead:
 

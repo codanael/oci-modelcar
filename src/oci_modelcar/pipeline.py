@@ -289,10 +289,16 @@ class Pipeline:
         self.plog.info(f"HF repo  : {self.cfg.hf_repo}")
         self.plog.info(f"Revision : {revision}")
 
-        files = self.downloader.list_files(self.cfg.hf_repo, revision, self.cfg.allow_patterns)
+        files = self.downloader.list_files(
+            self.cfg.hf_repo,
+            revision,
+            self.cfg.allow_patterns,
+            self.cfg.ignore_patterns,
+        )
         if not files:
             raise ConfigError(
                 f"no files matched allow_patterns {self.cfg.allow_patterns} "
+                f"with ignore_patterns {self.cfg.ignore_patterns} "
                 f"in {self.cfg.hf_repo}@{revision}"
             )
         self.plog.info(f"{len(files)} files matched")

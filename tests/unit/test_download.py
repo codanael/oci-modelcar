@@ -116,6 +116,120 @@ def test_list_files_extracts_lfs_sha256():
     assert by_path["config.json"].lfs_sha256 is None
 
 
+@pytest.mark.parametrize(
+    ("inp", "expected"),
+    [
+        ((".safetensors",), ("*.safetensors",)),
+        ((".json", ".md"), ("*.json", "*.md")),
+        (("consolidated-*",), ("consolidated-*",)),
+        (("model-*.safetensors",), ("model-*.safetensors",)),
+        (("original/*.safetensors",), ("original/*.safetensors",)),
+        (("images/*",), ("images/*",)),
+        (("?ata.bin",), ("?ata.bin",)),
+        (("file[0-9].bin",), ("file[0-9].bin",)),
+        ((".json", "images/*"), ("*.json", "images/*")),
+        ((), ()),
+    ],
+)
+def test_compile_filter_rewrites_bare_tokens_to_suffix_globs(
+    inp: tuple[str, ...], expected: tuple[str, ...]
+) -> None:
+    from oci_modelcar.download import _compile_filter
+
+    assert _compile_filter(inp) == expected
+
+
+def test_list_files_supports_glob_in_allow_patterns() -> None:
+    """When a user passes a glob (e.g. 'model-*.safetensors'), match it as a
+    glob across the full path rather than as a bare suffix."""
+    api = MagicMock()
+    api.list_repo_tree.return_value = [
+        _file_mock("model-00001-of-00003.safetensors", 1000),
+        _file_mock("consolidated-00001-of-00003.safetensors", 1000),
+        _file_mock("config.json", 100),
+    ]
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+    files = d.list_files("mistralai/Mistral", "main", allow=("model-*.safetensors", ".json"))
+    paths = [f.path for f in files]
+    assert "model-00001-of-00003.safetensors" in paths
+    assert "config.json" in paths
+    assert "consolidated-00001-of-00003.safetensors" not in paths
+
+
+def test_list_files_ignore_patterns_excludes_matches() -> None:
+    """ignore_patterns drops files that allow_patterns admitted."""
+    api = MagicMock()
+    api.list_repo_tree.return_value = [
+        _file_mock("model-00001-of-00003.safetensors", 1000),
+        _file_mock("consolidated-00001-of-00003.safetensors", 1000),
+        _file_mock("config.json", 100),
+        _file_mock("params.json", 50),
+    ]
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+    files = d.list_files(
+        "mistralai/Mistral",
+        "main",
+        allow=(".safetensors", ".json"),
+        ignore=("consolidated-*", "params.json"),
+    )
+    paths = [f.path for f in files]
+    assert paths == [
+        "config.json",
+        "model-00001-of-00003.safetensors",
+    ]
+
+
+def test_list_files_ignore_wins_when_both_match() -> None:
+    """When a file matches both allow and ignore, ignore wins."""
+    api = MagicMock()
+    api.list_repo_tree.return_value = [
+        _file_mock("consolidated-00001-of-00003.safetensors", 1000),
+    ]
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+    files = d.list_files(
+        "mistralai/Mistral",
+        "main",
+        allow=(".safetensors",),
+        ignore=("consolidated-*",),
+    )
+    assert files == []
+
+
+def test_list_files_ignore_default_empty_preserves_behavior() -> None:
+    """Calling list_files without ignore must behave identically to the old
+    suffix-only API. This guards backwards compatibility for any internal
+    caller still using the two-arg form."""
+    api = MagicMock()
+    api.list_repo_tree.return_value = [
+        _file_mock("model.safetensors", 1000),
+        _file_mock("readme.md", 50),
+    ]
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+    files = d.list_files("Qwen/Qwen2.5-7B", "main", allow=(".safetensors", ".md"))
+    paths = {f.path for f in files}
+    assert paths == {"model.safetensors", "readme.md"}
+
+
+def test_list_files_ignore_glob_crosses_slash_boundary() -> None:
+    """fnmatch.fnmatchcase '*' spans '/', so 'images/*' matches everything
+    nested under 'images/' (including further subdirs)."""
+    api = MagicMock()
+    api.list_repo_tree.return_value = [
+        _file_mock("config.json", 100),
+        _file_mock("images/banner.png", 10_000),
+        _file_mock("images/sub/icon.png", 500),
+    ]
+    d = HfDownloader(api=api, session=MagicMock(), spool_dir=None, stop_event=None)
+    files = d.list_files(
+        "x/y",
+        "main",
+        allow=(".json", ".png"),
+        ignore=("images/*",),
+    )
+    paths = [f.path for f in files]
+    assert paths == ["config.json"]
+
+
 def test_download_skips_if_final_already_present_with_matching_size(tmp_path: Path) -> None:
     """If <spool>/sources/<path> already exists at the expected size, return
     it without issuing any HTTP request — the file was completed in a prior
