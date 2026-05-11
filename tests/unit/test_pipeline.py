@@ -267,13 +267,6 @@ def _build_pipeline(tmp_path: Path, **cfg_overrides: object) -> tuple[Config, Pi
     return cfg, plog
 
 
-def test_pipeline_skips_when_tag_matches_existing_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If target tag exists with matching digest, log + exit 0 (no push)."""
-    pytest.skip("Tag conflict policy is exercised in task 8.6 manifest tests")
-
-
 def test_pipeline_resolves_revision_and_lists_files(tmp_path: Path) -> None:
     cfg, plog = _build_pipeline(tmp_path)
     fake_downloader = MagicMock()
