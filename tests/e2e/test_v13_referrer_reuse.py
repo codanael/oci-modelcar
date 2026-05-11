@@ -88,11 +88,19 @@ def deletable_registry(request):  # type: ignore[no-untyped-def]
     back to the sha256-<hex> tag schema — no referrers API implemented
     upstream as of May 2026) and zot (native referrers support).
 
-    **Function-scoped** rather than module-scoped: zot deduplicates
-    manifest blobs by content across repos, so pushing identical
-    deterministic records to repo A and then repo B in the same
-    registry leaves repo B's referrers index empty (the manifest "lives"
-    in A only). Each test gets its own fresh registry to avoid this.
+    **Function-scoped** rather than module-scoped: zot's manifest
+    storage is content-addressed and deduplicated across repos in the
+    same registry instance. When our deterministic record artifact
+    (same `subject`, same layer, same annotations) is PUT to repo A by
+    one test and then to repo B by the next, zot recognizes the
+    content as already present, returns 201 idempotently, echoes
+    ``Oci-Subject`` — but its per-repo native referrers index for
+    repo B's anchor remains empty (no fresh PUT against B triggered an
+    index update). The subsequent GET
+    ``/v2/repo_B/referrers/<anchor>`` returns 200 with an empty index.
+    Tests against a different repo per test must therefore not share
+    a registry instance. Function scope spins a fresh registry per
+    test (~140 s total for 12 tests, acceptable).
     """
     if subprocess.run(["docker", "version"], capture_output=True).returncode != 0:
         pytest.skip("docker not available")
