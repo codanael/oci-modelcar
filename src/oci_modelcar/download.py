@@ -4,6 +4,7 @@ mid-stream cancellation, atomic write, cross-origin auth strip."""
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import hashlib
 import http.client
 import logging
@@ -42,6 +43,23 @@ _FATAL_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
     requests.exceptions.ProxyError,
 )
 _CHUNK_DEFAULT = 1024 * 1024  # 1 MiB stop_event polling granularity
+_GLOB_META = "*?["
+
+
+def _compile_filter(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize user-supplied filter tokens for fnmatch.
+
+    A token containing no glob metacharacters (``*?[``) is treated as a
+    suffix and rewritten to ``*<token>``. A token already carrying glob
+    metacharacters is kept verbatim. This preserves the historical
+    ``endswith``-style behavior of ``--allow-patterns`` while letting
+    new patterns use full globs (e.g. ``consolidated-*``).
+    """
+    return tuple(p if any(c in p for c in _GLOB_META) else f"*{p}" for p in patterns)
+
+
+def _path_matches_any(path: str, compiled: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(path, p) for p in compiled)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +116,13 @@ class HfDownloader:
             )
         return info.sha
 
-    def list_files(self, repo: str, revision: str, allow: tuple[str, ...]) -> list[HfFile]:
+    def list_files(
+        self,
+        repo: str,
+        revision: str,
+        allow: tuple[str, ...],
+        ignore: tuple[str, ...] = (),
+    ) -> list[HfFile]:
         out: list[HfFile] = []
         try:
             tree = self.api.list_repo_tree(repo, revision=revision, recursive=True)
@@ -120,6 +144,8 @@ class HfDownloader:
                 f"Repository not found: {repo}: {e}",
                 hint=f"check the repo name at https://huggingface.co/{repo}",
             ) from e
+        allow_compiled = _compile_filter(allow)
+        ignore_compiled = _compile_filter(ignore)
         for _entry in entries:
             # Narrow to files. huggingface_hub yields RepoFile/RepoFolder; the
             # canonical discriminant is isinstance(RepoFile) — RepoFolder has
@@ -128,7 +154,9 @@ class HfDownloader:
             if not isinstance(_entry, RepoFile):
                 continue
             entry = _entry
-            if not any(entry.path.endswith(ext) for ext in allow):
+            if not _path_matches_any(entry.path, allow_compiled):
+                continue
+            if _path_matches_any(entry.path, ignore_compiled):
                 continue
             lfs = entry.lfs
             sha = lfs.sha256 if lfs is not None else None

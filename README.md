@@ -98,6 +98,8 @@ use plain HTTP. Pass an explicit `http://` or `https://` prefix on
 | `--hf-revision` | `main` | Branch, tag, or 40-char SHA |
 | `--target-tag` | `<sha[:12]>` | Image tag |
 | `--also-tag` | — | CSV of alias tags |
+| `--allow-patterns` | `.safetensors .json .txt .md .model` | Files to include. Bare tokens are suffix filters; tokens with `*`/`?`/`[…]` are full `fnmatch` globs on the repo path. |
+| `--ignore-patterns` | empty | Files to exclude after `--allow-patterns` admits. Same syntax. Wins on conflict. Needed for repos shipping multiple weight formats (e.g. `--ignore-patterns "consolidated*"` to skip the Mistral native layout in `mistralai/Mistral-Medium-3.5-128B`). |
 | `--workers` | `1` | Parallel layers (cap 8) |
 | `--spool-dir` | `$TMPDIR/oci-modelcar` | Directory for downloaded files and built tar layers |
 | `--clean-hf-after-push` | off | Delete each HF file after its layer is pushed |

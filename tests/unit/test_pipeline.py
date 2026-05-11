@@ -298,6 +298,38 @@ def test_pipeline_preflight_no_files_raises_config(tmp_path: Path) -> None:
         pipeline._preflight()
 
 
+def test_pipeline_preflight_forwards_ignore_patterns(tmp_path: Path) -> None:
+    cfg, plog = _build_pipeline(tmp_path, ignore_patterns=("consolidated-*", "params.json"))
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    fake_downloader.list_files.return_value = [HfFile("model.safetensors", 1000, None)]
+    fake_registry = MagicMock(target_repo="models/x")
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    pipeline._preflight()
+
+    fake_downloader.list_files.assert_called_once_with(
+        "foo/bar",
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        (".safetensors", ".json"),
+        ("consolidated-*", "params.json"),
+    )
+
+
+def test_pipeline_preflight_error_mentions_ignore_patterns(tmp_path: Path) -> None:
+    cfg, plog = _build_pipeline(tmp_path, ignore_patterns=("consolidated-*",))
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    fake_downloader.list_files.return_value = []
+    fake_registry = MagicMock(target_repo="models/x")
+
+    pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
+    from oci_modelcar.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=r"ignore_patterns.*consolidated-\*"):
+        pipeline._preflight()
+
+
 # ---------------------------------------------------------------------------
 # Task 8.4: Pipeline disk space check
 # ---------------------------------------------------------------------------

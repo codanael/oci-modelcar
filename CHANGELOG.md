@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Glob-aware file filtering with `--ignore-patterns`.** Both
+  `--allow-patterns` and the new `--ignore-patterns` (also: env
+  `IGNORE_PATTERNS`) now accept full `fnmatch`-style globs
+  (`*`, `?`, `[…]`), evaluated case-sensitively across the full repo
+  path (`*` spans `/`). Bare tokens without glob metacharacters
+  continue to behave as suffix filters, so the default
+  `--allow-patterns .safetensors .json .txt .md .model` and any
+  existing user invocation are byte-for-byte unchanged. New patterns
+  can express path-shape filters previously impossible —
+  `--ignore-patterns "consolidated*" "params.json" "images/*"` —
+  which is the only way to push e.g. `mistralai/Mistral-Medium-3.5-128B`
+  without doubling the image size with the parallel Mistral native
+  layout it ships alongside the HF layout. Inclusion is
+  `any(allow) and not any(ignore)`, matching
+  `huggingface_hub.snapshot_download` semantics. Filtering is upstream
+  of layer construction, so manifest digest determinism is preserved
+  for any given filter setting.
+
 ## [1.1.0] - 2026-05-11
 
 ### Added

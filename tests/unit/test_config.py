@@ -183,3 +183,38 @@ def test_config_upload_mode_flag_rejected(monkeypatch):
     monkeypatch.setenv("TARGET_REPO", "models/x")
     with pytest.raises(SystemExit):
         Config.from_env_and_args(["--upload-mode", "chunked"])
+
+
+def test_config_ignore_patterns_default_empty(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.delenv("IGNORE_PATTERNS", raising=False)
+    cfg = Config.from_env_and_args([])
+    assert cfg.ignore_patterns == ()
+
+
+def test_config_ignore_patterns_cli(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--ignore-patterns", "consolidated-* params.json"])
+    assert cfg.ignore_patterns == ("consolidated-*", "params.json")
+
+
+def test_config_ignore_patterns_env(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("IGNORE_PATTERNS", "images/* *.tmp")
+    cfg = Config.from_env_and_args([])
+    assert cfg.ignore_patterns == ("images/*", "*.tmp")
+
+
+def test_config_ignore_patterns_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("IGNORE_PATTERNS", "from-env")
+    cfg = Config.from_env_and_args(["--ignore-patterns", "from-cli"])
+    assert cfg.ignore_patterns == ("from-cli",)

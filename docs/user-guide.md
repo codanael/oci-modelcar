@@ -145,7 +145,8 @@ running with `--log-style azure` (see [CI/CD integration](#cicd-integration)).
 | `--hf-repo <org/name>` | `HF_REPO` | required | HuggingFace repo (e.g. `Qwen/Qwen2.5-7B-Instruct`) |
 | `--hf-revision <ref>` | `HF_REVISION` | `main` | Branch, tag, or 40-char SHA |
 | `--hf-endpoint <url>` | `HF_ENDPOINT` | `https://huggingface.co` | Override for HF mirrors / proxies |
-| `--allow-patterns <pat...>` | `ALLOW_PATTERNS` | `.safetensors .json .txt .md .model` | Space-separated extensions; only matching files are pulled |
+| `--allow-patterns <pat...>` | `ALLOW_PATTERNS` | `.safetensors .json .txt .md .model` | Space-separated patterns; only matching files are pulled. Bare tokens (`.safetensors`) act as suffix filters; tokens with `*`, `?`, or `[…]` are full `fnmatch` globs on the repo path. |
+| `--ignore-patterns <pat...>` | `IGNORE_PATTERNS` | empty | Space-separated patterns to exclude after `--allow-patterns` admits. Same syntax. Wins over `--allow-patterns` when both match. |
 
 ### Target (OCI registry)
 
@@ -193,6 +194,51 @@ running with `--log-style azure` (see [CI/CD integration](#cicd-integration)).
 - `--state-file` (no local state)
 - `--chunk-mib` (single PATCH per blob — chunking removed)
 - `--upload-mode` (one mode)
+
+---
+
+## Filtering when a repo ships multiple weight formats
+
+Some HuggingFace repos ship more than one complete weight set in the
+same root directory, sharing the `.safetensors` extension. The
+canonical example is `mistralai/Mistral-Medium-3.5-128B`, which packs
+both the HF transformers layout (`model-*.safetensors` + `config.json`,
+consumed by vLLM, SGLang, transformers) and the Mistral native layout
+(`consolidated-*.safetensors` + `params.json`, consumed by
+`mistral-inference`) — roughly 134 GB each, ~267 GB total. Suffix-only
+filters cannot tell them apart.
+
+`--ignore-patterns` lets you exclude files by full glob on the repo
+path. Bare tokens (`.safetensors`) still act as suffix filters for
+backwards compatibility, but any token containing `*`, `?`, or `[…]`
+becomes a full `fnmatch` glob — and `*` spans `/`, so `images/*`
+matches anything under `images/` and `consolidated*` matches both
+`consolidated-00001-of-00003.safetensors` and
+`consolidated.safetensors.index.json`.
+
+Push only the HF layout (what KServe + vLLM consumes), skipping the
+Mistral native layout and the README image assets:
+
+```bash
+oci-modelcar push \
+  --hf-repo mistralai/Mistral-Medium-3.5-128B \
+  --registry registry.example.com \
+  --target-repo models/mistral-medium-3.5 \
+  --ignore-patterns "consolidated*" "params.json" "images/*"
+```
+
+The reverse — push only the Mistral native layout:
+
+```bash
+oci-modelcar push ... \
+  --ignore-patterns "model-*" "config.json" "generation_config.json" "images/*"
+```
+
+Precedence rule: a file passes when **at least one** `--allow-patterns`
+matches **and** **zero** `--ignore-patterns` match. Same semantics as
+`huggingface_hub.snapshot_download`. Filtering is upstream of layer
+construction, so the manifest digest stays deterministic across runs
+with the same filter settings.
 
 ---
 
@@ -654,11 +700,15 @@ Either:
 - The HF revision has no files matching the default
   `--allow-patterns .safetensors .json .txt .md .model`
 - `--allow-patterns` was set too narrowly
+- `--ignore-patterns` excluded everything `--allow-patterns` admitted
 
 Inspect the repo at `https://huggingface.co/<repo>/tree/<revision>`
-and adjust. To pull everything, set
+and adjust. The error message echoes both lists so you can see what
+was applied. To pull everything, set
 `--allow-patterns ".bin .safetensors .json .txt .md .model .tokenizer"`
-or similar (space-separated extensions; matched as suffix).
+or similar. Bare extensions are matched as suffix; add `*`, `?`, or
+`[…]` for full `fnmatch` globs (see "Filtering when a repo ships
+multiple weight formats" above).
 
 ### "HF SSL EOF mid-stream" warnings
 

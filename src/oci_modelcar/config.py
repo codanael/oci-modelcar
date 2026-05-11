@@ -47,6 +47,7 @@ class Config:
     target_tag: str | None = None
     also_tags: list[str] = field(default_factory=list)
     allow_patterns: tuple[str, ...] = field(default_factory=lambda: tuple(_DEFAULT_ALLOW.split()))
+    ignore_patterns: tuple[str, ...] = field(default_factory=tuple)
     layer_prefix: str = "models/"
     workers: int = 1
     spool_dir: Path = field(default_factory=_default_spool_dir)
@@ -77,6 +78,7 @@ class Config:
             allow_patterns=tuple(
                 (ns.allow_patterns or _envstr("ALLOW_PATTERNS", _DEFAULT_ALLOW)).split()
             ),
+            ignore_patterns=tuple((ns.ignore_patterns or _envstr("IGNORE_PATTERNS", "")).split()),
             layer_prefix=(
                 ns.layer_prefix
                 if ns.layer_prefix is not None
@@ -147,6 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-tag", default=None)
     p.add_argument("--also-tag", default=None, help="CSV list of additional tags")
     p.add_argument("--allow-patterns", default=None)
+    p.add_argument("--ignore-patterns", default=None)
     p.add_argument("--layer-prefix", default=None)
     p.add_argument("--workers", default=None, type=int)
     p.add_argument("--spool-dir", default=None)
