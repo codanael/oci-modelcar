@@ -143,11 +143,21 @@ class HfDownloader:
         hf_file: HfFile,
         progress_cb: Callable[[int], None] | None = None,
     ) -> Path:
-        """Download to <spool>/sources/<hf_path>.partial, atomic rename to .../<hf_path>."""
+        """Download to <spool>/sources/<hf_path>.partial, atomic rename to .../<hf_path>.
+
+        If a complete file already exists at the final path with the expected
+        size, return it without any HTTP traffic. Atomic-rename guarantees the
+        on-disk file is a valid prior download (size + LFS sha256 were already
+        verified before the rename); re-hashing on every re-run would defeat
+        the optimization.
+        """
         if self.spool_dir is None:
             raise RuntimeError("spool_dir required for download()")
         sources = self.spool_dir / "sources"
         final = sources / hf_file.path
+        if final.exists() and final.stat().st_size == hf_file.size:
+            log.debug("HF download skipped, using cached %s", final)
+            return final
         partial = sources / (hf_file.path + ".partial")
         partial.parent.mkdir(parents=True, exist_ok=True)
 

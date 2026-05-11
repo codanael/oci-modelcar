@@ -116,6 +116,43 @@ def test_list_files_extracts_lfs_sha256():
     assert by_path["config.json"].lfs_sha256 is None
 
 
+def test_download_skips_if_final_already_present_with_matching_size(tmp_path: Path) -> None:
+    """If <spool>/sources/<path> already exists at the expected size, return
+    it without issuing any HTTP request — the file was completed in a prior
+    run (atomic-rename guarantees it's valid)."""
+    spool = tmp_path / "spool"
+    sources = spool / "sources"
+    sources.mkdir(parents=True)
+    payload = b"cached-bytes-from-prior-run"
+    (sources / "file.txt").write_bytes(payload)
+
+    session = MagicMock()
+    d = _make_downloader(session, spool)
+    f = HfFile(path="file.txt", size=len(payload), lfs_sha256=None)
+
+    result = d.download("repo", "main", f)
+    assert result == sources / "file.txt"
+    assert result.read_bytes() == payload
+    # Critically: no HTTP request must have been made.
+    session.get.assert_not_called()
+
+
+def test_download_does_not_skip_if_final_size_mismatch(tmp_path: Path) -> None:
+    """A leftover file with wrong size (interrupted prior write that somehow
+    got renamed) is re-downloaded, not trusted."""
+    spool = tmp_path / "spool"
+    sources = spool / "sources"
+    sources.mkdir(parents=True)
+    (sources / "file.txt").write_bytes(b"too-short")  # 9 bytes
+
+    payload = b"the real content, longer"
+    d = _make_downloader(_make_session_serving_payload(payload), spool)
+    f = HfFile(path="file.txt", size=len(payload), lfs_sha256=None)
+
+    result = d.download("repo", "main", f)
+    assert result.read_bytes() == payload
+
+
 def test_download_writes_file_and_returns_path(tmp_path: Path) -> None:
     payload = b"hello world"
     spool = tmp_path / "spool"
