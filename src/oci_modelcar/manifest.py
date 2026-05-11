@@ -12,19 +12,30 @@ ML_TAR = "application/vnd.oci.image.layer.v1.tar"
 ML_CFG = "application/vnd.oci.image.config.v1+json"
 ML_MAN = "application/vnd.oci.image.manifest.v1+json"
 
+# Reverse-DNS scoped annotations for layer reuse across re-pushes.
+# A future run can match (hf_path, hf_sha256) against an existing manifest's
+# annotations and skip HF download + tar build + push for unchanged files.
+ANN_HF_PATH = "io.github.codanael.modelcar.hf-path"
+ANN_HF_SHA256 = "io.github.codanael.modelcar.hf-sha256"
+
 
 @dataclass(frozen=True, slots=True)
 class BlobDescriptor:
     media_type: str
     digest: str
     size: int
-    hf_path: str  # not serialized; used by runner for ordering and logging
+    hf_path: str
+    hf_sha256: str | None = None  # 64-hex when the HF file is LFS-backed
 
     def to_dict(self) -> dict[str, object]:
+        annotations: dict[str, str] = {ANN_HF_PATH: self.hf_path}
+        if self.hf_sha256 is not None:
+            annotations[ANN_HF_SHA256] = self.hf_sha256
         return {
             "mediaType": self.media_type,
             "digest": self.digest,
             "size": self.size,
+            "annotations": annotations,
         }
 
 

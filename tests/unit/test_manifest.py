@@ -4,6 +4,8 @@ import json
 import pytest
 
 from oci_modelcar.manifest import (
+    ANN_HF_PATH,
+    ANN_HF_SHA256,
     BlobDescriptor,
     build_config_bytes,
     build_manifest_bytes,
@@ -22,6 +24,7 @@ def test_blob_descriptor_to_dict():
         "mediaType": "application/vnd.oci.image.layer.v1.tar",
         "digest": "sha256:" + "a" * 64,
         "size": 12345,
+        "annotations": {ANN_HF_PATH: "model.safetensors"},
     }
 
 
@@ -102,6 +105,75 @@ def test_derive_tag_explicit_overrides():
 )
 def test_derive_tag_sanitizes_non_sha(raw, expected):
     assert derive_tag(raw, explicit=None) == expected
+
+
+def test_blob_descriptor_emits_hf_annotations():
+    """Layer descriptors carry modelcar hf-path / hf-sha256 annotations so
+    that future runs can reuse the layer when the source file is unchanged."""
+    d = BlobDescriptor(
+        media_type="application/vnd.oci.image.layer.v1.tar",
+        digest="sha256:" + "a" * 64,
+        size=100,
+        hf_path="weights/model.safetensors",
+        hf_sha256="b" * 64,
+    )
+    out = d.to_dict()
+    assert out["annotations"] == {
+        ANN_HF_PATH: "weights/model.safetensors",
+        ANN_HF_SHA256: "b" * 64,
+    }
+
+
+def test_blob_descriptor_emits_path_only_when_no_lfs_sha():
+    """Non-LFS files (small configs) have no sha256; emit just the path annotation."""
+    d = BlobDescriptor(
+        media_type="application/vnd.oci.image.layer.v1.tar",
+        digest="sha256:" + "a" * 64,
+        size=100,
+        hf_path="config.json",
+        hf_sha256=None,
+    )
+    out = d.to_dict()
+    assert out["annotations"] == {ANN_HF_PATH: "config.json"}
+
+
+def test_manifest_layers_carry_annotations():
+    layers = [
+        BlobDescriptor(
+            "application/vnd.oci.image.layer.v1.tar",
+            "sha256:" + "a" * 64,
+            100,
+            "model.safetensors",
+            "f" * 64,
+        ),
+    ]
+    manifest = json.loads(build_manifest_bytes("sha256:" + "c" * 64, 50, layers))
+    layer = manifest["layers"][0]
+    assert layer["annotations"][ANN_HF_PATH] == "model.safetensors"
+    assert layer["annotations"][ANN_HF_SHA256] == "f" * 64
+
+
+def test_manifest_digest_stable_across_runs_with_annotations():
+    """Adding annotations must NOT introduce non-determinism."""
+    layers = [
+        BlobDescriptor(
+            "application/vnd.oci.image.layer.v1.tar",
+            "sha256:" + "a" * 64,
+            100,
+            "f1.bin",
+            "1" * 64,
+        ),
+        BlobDescriptor(
+            "application/vnd.oci.image.layer.v1.tar",
+            "sha256:" + "b" * 64,
+            200,
+            "f2.bin",
+            "2" * 64,
+        ),
+    ]
+    a = build_manifest_bytes("sha256:" + "c" * 64, 50, layers)
+    b = build_manifest_bytes("sha256:" + "c" * 64, 50, layers)
+    assert a == b
 
 
 def test_derive_tag_explicit_validated():

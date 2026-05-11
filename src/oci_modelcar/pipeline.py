@@ -114,6 +114,7 @@ class FileWorker:
                     digest=digest,
                     size=int(existing["size"]),
                     hf_path=hf_file.path,
+                    hf_sha256=hf_file.lfs_sha256,
                 )
 
             # d. PUSH
@@ -137,7 +138,11 @@ class FileWorker:
 
             self._say(f"{hf_file.path}: pushed {digest[:19]}")
             return BlobDescriptor(
-                media_type=ML_TAR, digest=digest, size=layer_size, hf_path=hf_file.path
+                media_type=ML_TAR,
+                digest=digest,
+                size=layer_size,
+                hf_path=hf_file.path,
+                hf_sha256=hf_file.lfs_sha256,
             )
         finally:
             # f. CLEANUP — always remove tar; remove source if configured
