@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Crash-resilient reuse via OCI 1.1 referrer artifacts.** A run that
+  pushes layer blobs but crashes before the final manifest is committed
+  no longer orphans those blobs when sources have been deleted by
+  `--clean-hf-after-push`. On every push the pipeline now writes one
+  tiny (~1 KB) referrer artifact per layer, anchored on a deterministic
+  stub manifest whose digest is a pure function of
+  `(hf_repo, hf_revision, allow_patterns, ignore_patterns, layer_prefix)`.
+  On resume the pipeline queries the OCI referrers API
+  (`GET /v2/<repo>/referrers/<anchor_digest>`) — natively on Artifactory
+  ≥ 7.90.1 and `registry:2` ≥ 2.8, or via the spec-defined
+  `sha256-<hex>` fallback tag schema on older registries (detected at
+  runtime via the `OCI-Subject` response header). Reuse records map
+  `(hf_path, hf_sha256) → layer_digest`, so the resume run rebuilds
+  the manifest with zero HF traffic and zero blob re-push. The
+  pre-existing v1.1 manifest-based reuse-map is still consulted and
+  wins on key collision (more authoritative — backed by a successful
+  final manifest).
+- **`--no-reuse-records` opt-out.** Disables writing the referrer
+  artifacts described above. Documented as a corner-case escape hatch
+  for users who want a registry repo clean of metadata artifacts or
+  push through middleware that mishandles unknown `artifactType`s.
+  Defaults to off.
 - **Glob-aware file filtering with `--ignore-patterns`.** Both
   `--allow-patterns` and the new `--ignore-patterns` (also: env
   `IGNORE_PATTERNS`) now accept full `fnmatch`-style globs

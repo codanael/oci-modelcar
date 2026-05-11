@@ -218,3 +218,29 @@ def test_config_ignore_patterns_cli_overrides_env(monkeypatch):
     monkeypatch.setenv("IGNORE_PATTERNS", "from-env")
     cfg = Config.from_env_and_args(["--ignore-patterns", "from-cli"])
     assert cfg.ignore_patterns == ("from-cli",)
+
+
+def test_config_no_reuse_records_default_off(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.delenv("NO_REUSE_RECORDS", raising=False)
+    cfg = Config.from_env_and_args([])
+    assert cfg.no_reuse_records is False
+
+
+def test_config_no_reuse_records_cli(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    cfg = Config.from_env_and_args(["--no-reuse-records"])
+    assert cfg.no_reuse_records is True
+
+
+def test_config_no_reuse_records_env(monkeypatch):
+    monkeypatch.setenv("HF_REPO", "foo/bar")
+    monkeypatch.setenv("REGISTRY", "registry.example.com")
+    monkeypatch.setenv("TARGET_REPO", "models/x")
+    monkeypatch.setenv("NO_REUSE_RECORDS", "1")
+    cfg = Config.from_env_and_args([])
+    assert cfg.no_reuse_records is True

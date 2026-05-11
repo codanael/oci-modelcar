@@ -48,6 +48,7 @@ class Config:
     also_tags: list[str] = field(default_factory=list)
     allow_patterns: tuple[str, ...] = field(default_factory=lambda: tuple(_DEFAULT_ALLOW.split()))
     ignore_patterns: tuple[str, ...] = field(default_factory=tuple)
+    no_reuse_records: bool = False
     layer_prefix: str = "models/"
     workers: int = 1
     spool_dir: Path = field(default_factory=_default_spool_dir)
@@ -79,6 +80,7 @@ class Config:
                 (ns.allow_patterns or _envstr("ALLOW_PATTERNS", _DEFAULT_ALLOW)).split()
             ),
             ignore_patterns=tuple((ns.ignore_patterns or _envstr("IGNORE_PATTERNS", "")).split()),
+            no_reuse_records=ns.no_reuse_records or _envbool("NO_REUSE_RECORDS", False),
             layer_prefix=(
                 ns.layer_prefix
                 if ns.layer_prefix is not None
@@ -150,6 +152,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--also-tag", default=None, help="CSV list of additional tags")
     p.add_argument("--allow-patterns", default=None)
     p.add_argument("--ignore-patterns", default=None)
+    p.add_argument(
+        "--no-reuse-records",
+        action="store_true",
+        default=False,
+        help="Don't write OCI referrer artifacts for crash-resilient reuse",
+    )
     p.add_argument("--layer-prefix", default=None)
     p.add_argument("--workers", default=None, type=int)
     p.add_argument("--spool-dir", default=None)
