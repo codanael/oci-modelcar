@@ -1,10 +1,23 @@
 """E2E: v1.3 OCI 1.1 referrer-based crash-resilient reuse.
 
-Four scenarios, parametrized over ``registry:2`` (fallback tag schema —
-the client maintains the ``sha256-<hex>`` index manually because the
-registry does not echo ``OCI-Subject``) and ``registry:3`` (also
-exercised via the fallback path in 3.1.1; the native API endpoint
-returns 404 even after a record push):
+Parametrized over three real registries:
+
+* ``registry:2`` v2.8.3 — no referrers API (route never existed in the v2
+  series). Client uses the spec fallback tag schema.
+* ``registry:3`` v3.1.1 — also no referrers API; the v3 series ships with
+  the same Base/Manifest/Catalog/Tags/Blob/BlobUpload routes as v2, plus
+  fixes. The OCI 1.1 referrers feature is still an open proposal
+  (https://github.com/distribution/distribution/issues/3716) and was
+  not implemented in any released distribution/distribution v3.x as of
+  May 2026. Client uses the fallback tag schema.
+* ``ghcr.io/project-zot/zot-linux-amd64`` — implements the native OCI
+  1.1 referrers API (``GET /v2/<name>/referrers/<digest>`` returns an
+  image-index of subjects). Client uses the native code path.
+
+Each scenario is run against each registry. Both code paths are
+spec-compliant and produce the same observable end state: records
+reachable via *some* path, resume picks them up, zero HF re-download
+on crash recovery.
 
 1. Anchor manifest + per-layer reuse records are written to the registry
    on every push. Inspect via direct HTTP.
@@ -63,30 +76,37 @@ def _wait_registry(port: int, timeout: float = 30.0) -> None:
     raise RuntimeError(f"registry on port {port} did not become healthy within {timeout}s")
 
 
-@pytest.fixture(scope="module", params=["registry:2", "registry:3"])
-def deletable_registry(request):  # type: ignore[no-untyped-def]
-    """A registry with ``REGISTRY_STORAGE_DELETE_ENABLED=true`` so the resume
-    test can DELETE the target-tag manifest to simulate a crash.
+_ZOT_IMAGE = "ghcr.io/project-zot/zot-linux-amd64:latest"
 
-    Parametrized over registry:2 (no native OCI 1.1 referrers — the client
-    must use the spec fallback tag schema) and registry:3 (native referrers
-    API). Both code paths must produce correct end-to-end behavior.
+
+@pytest.fixture(scope="function", params=["registry:2", "registry:3", _ZOT_IMAGE])
+def deletable_registry(request):  # type: ignore[no-untyped-def]
+    """A registry that supports DELETE manifests so the resume test can
+    simulate a crash by removing the target-tag manifest.
+
+    Parametrized over distribution/distribution v2 and v3 (both fall
+    back to the sha256-<hex> tag schema — no referrers API implemented
+    upstream as of May 2026) and zot (native referrers support).
+
+    **Function-scoped** rather than module-scoped: zot deduplicates
+    manifest blobs by content across repos, so pushing identical
+    deterministic records to repo A and then repo B in the same
+    registry leaves repo B's referrers index empty (the manifest "lives"
+    in A only). Each test gets its own fresh registry to avoid this.
     """
     if subprocess.run(["docker", "version"], capture_output=True).returncode != 0:
         pytest.skip("docker not available")
 
     image = request.param
     port = _free_port()
-    safe = image.replace(":", "-")
+    safe = image.split("/")[-1].replace(":", "-")
     name = f"oci-modelcar-v13-reg-{safe}-{port}"
     subprocess.run(["docker", "rm", "-f", name], check=False, capture_output=True)
-    # registry:3 uses a different config schema. The simplest reliable way
-    # to enable deletes across both versions is the legacy env var, which
-    # both images still honor.
-    env = {
-        "registry:2": ["-e", "REGISTRY_STORAGE_DELETE_ENABLED=true"],
-        "registry:3": ["-e", "REGISTRY_STORAGE_DELETE_ENABLED=true"],
-    }[image]
+    # distribution/distribution honors REGISTRY_STORAGE_DELETE_ENABLED.
+    # zot enables manifest DELETE by default; its config schema differs.
+    extra_args: list[str] = []
+    if image in ("registry:2", "registry:3"):
+        extra_args = ["-e", "REGISTRY_STORAGE_DELETE_ENABLED=true"]
     subprocess.run(
         [
             "docker",
@@ -97,7 +117,7 @@ def deletable_registry(request):  # type: ignore[no-untyped-def]
             name,
             "-p",
             f"{port}:5000",
-            *env,
+            *extra_args,
             image,
         ],
         check=True,
@@ -106,6 +126,15 @@ def deletable_registry(request):  # type: ignore[no-untyped-def]
     _wait_registry(port)
     yield {"port": port, "image": image}
     subprocess.run(["docker", "stop", name], check=False, capture_output=True)
+
+
+def _is_native_referrers_registry(image: str) -> bool:
+    """True if the registry image implements the OCI 1.1 referrers API.
+
+    distribution/distribution v2/v3 do not (proposal #3716 still open).
+    zot does, since v2.0.0+.
+    """
+    return "zot" in image
 
 
 def _read_records(base: str, anchor_digest: str) -> tuple[list[dict[str, object]], str]:
@@ -219,19 +248,15 @@ def test_anchor_and_records_written_on_push(deletable_registry: dict, tmp_path: 
     assert anchor["annotations"]["io.github.codanael.modelcar.hf-repo"] == HF_REPO
     assert anchor["annotations"]["io.github.codanael.modelcar.hf-revision"] == HF_REVISION
 
-    # 3) Records reachable via *some* path. Whether the client uses the
-    # native referrers API or the spec-defined fallback tag schema
-    # depends on whether the registry echoes OCI-Subject on PUT.
-    # registry:2 v2.8.3 does NOT echo OCI-Subject → client maintains the
-    # fallback tag. registry:3 v3.1.1 was expected to echo it but in
-    # practice does not for our artifact manifests, so the client also
-    # uses the fallback there. Both end states are spec-compliant.
+    # 3) Records reachable via the path appropriate for this registry.
     record_descriptors, mode = _read_records(base, anchor_digest)
-    assert mode in ("native", "fallback"), (
-        f"no records found via native OR fallback path on {image}; "
-        "v1.3 should always write records under one or the other"
+    expected_mode = "native" if _is_native_referrers_registry(image) else "fallback"
+    assert mode == expected_mode, (
+        f"on {image}, expected mode={expected_mode!r} but got mode={mode!r}; "
+        "either the registry's referrers support changed (update the helper) "
+        "or the client's OCI-Subject detection regressed"
     )
-    assert len(record_descriptors) >= 1, f"no reuse records in registry ({mode} mode)"
+    assert len(record_descriptors) >= 1, f"no reuse records found ({mode} mode)"
 
     # 4) Each record manifest carries hf-path + (when LFS) hf-sha256 annotations.
     paths_seen: set[str] = set()

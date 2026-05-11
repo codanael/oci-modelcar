@@ -115,6 +115,35 @@ def test_push_small_blob_post_then_put():
     assert sent_data[0] == data
 
 
+def test_push_small_blob_resolves_relative_location_header():
+    """zot returns ``Location: /v2/repo/blobs/uploads/<uuid>?...`` (a path,
+    no host). OCI Distribution spec allows this; the client must resolve
+    it against the registry base URL before issuing the PUT, otherwise
+    ``requests`` rejects the URL with InvalidSchema."""
+    data = b"config bytes"
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    fake_session = MagicMock()
+    fake_session.head.return_value = _make_response(404)
+    fake_session.post.return_value = _make_response(
+        202, {"Location": "/v2/repo/blobs/uploads/abc-uuid?_state=xyz"}
+    )
+
+    put_urls: list[str] = []
+
+    def put_handler(url: str, **kwargs: object) -> MagicMock:
+        put_urls.append(url)
+        return _make_response(201)
+
+    fake_session.put.side_effect = put_handler
+
+    push_small_blob(_make_client(fake_session), "repo", data)
+    # The PUT must have gone to the absolute URL (http://test + Location path).
+    assert put_urls[0].startswith("http://test/v2/repo/blobs/uploads/abc-uuid"), (
+        f"PUT URL not resolved against base: {put_urls[0]!r}"
+    )
+    assert f"digest={digest}" in put_urls[0]
+
+
 def test_push_manifest_returns_digest():
     body = json.dumps({"schemaVersion": 2, "config": {}, "layers": []}).encode()
     expected_digest = "sha256:" + hashlib.sha256(body).hexdigest()
