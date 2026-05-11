@@ -169,12 +169,14 @@ class RegistryReuseStore:
         """Return ``(hf_path, hf_sha256) → BlobDescriptor`` from records.
 
         Reads BOTH the native referrers API and the OCI 1.1 fallback tag
-        and unions the descriptors. We can't assume which path our prior
-        run used: a registry that supports native referrers GET but does
-        not echo ``OCI-Subject`` on PUT (e.g. zot in some versions) ends
-        up with records in the fallback tag even though the native
-        endpoint exists. Cost: at most 2 GETs per pipeline run, both
-        tiny. Missing or malformed records are silently skipped.
+        and unions the descriptors, dedup'd by record digest. The native
+        path alone would suffice for the common case (single registry
+        consistently supports or doesn't support native referrers), but
+        the union covers the upgrade scenario: a registry that didn't
+        echo ``OCI-Subject`` during an earlier run (records ended up in
+        the fallback tag) and now does (later runs go native). Cost:
+        at most 2 GETs per pipeline run, both tiny. Missing or
+        malformed records are silently skipped.
         """
         seen_record_digests: set[str] = set()
         descriptors: list[dict[str, object]] = []
