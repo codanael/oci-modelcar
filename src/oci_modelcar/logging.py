@@ -4,7 +4,21 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
+from collections.abc import Callable
 from typing import IO
+
+
+def fmt_bytes(n: int) -> str:
+    """Human-readable byte count using GB/MB/KB scaling."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f} GB"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f} MB"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f} KB"
+    return f"{n} B"
 
 
 class TextFormatter(logging.Formatter):
@@ -37,6 +51,7 @@ class PipelineLogger:
         self.verbose = verbose
         self.quiet = quiet
         self._fmt: logging.Formatter = AzureFormatter() if log_style == "azure" else TextFormatter()
+        self._lock = threading.Lock()
 
     def _emit(self, level: int, msg: str) -> None:
         if self.quiet and level < logging.WARNING:
@@ -52,13 +67,15 @@ class PipelineLogger:
             args=(),
             exc_info=None,
         )
-        print(self._fmt.format(rec), file=self.stream, flush=True)
+        with self._lock:
+            print(self._fmt.format(rec), file=self.stream, flush=True)
 
     def section(self, title: str) -> None:
-        if self.log_style == "azure":
-            print(f"##[section]{title}", file=self.stream, flush=True)
-        else:
-            print(f"\n== {title} ==", file=self.stream, flush=True)
+        with self._lock:
+            if self.log_style == "azure":
+                print(f"##[section]{title}", file=self.stream, flush=True)
+            else:
+                print(f"\n== {title} ==", file=self.stream, flush=True)
 
     def debug(self, msg: str) -> None:
         self._emit(logging.DEBUG, msg)
@@ -73,11 +90,44 @@ class PipelineLogger:
         self._emit(logging.ERROR, msg)
 
     def output_variable(self, name: str, value: str) -> None:
-        if self.log_style == "azure":
-            print(
-                f"##vso[task.setvariable variable={name};isOutput=true]{value}",
-                file=self.stream,
-                flush=True,
-            )
-        else:
-            print(f"{name}={value}", file=self.stream, flush=True)
+        with self._lock:
+            if self.log_style == "azure":
+                print(
+                    f"##vso[task.setvariable variable={name};isOutput=true]{value}",
+                    file=self.stream,
+                    flush=True,
+                )
+            else:
+                print(f"{name}={value}", file=self.stream, flush=True)
+
+
+class ProgressEmitter:
+    """Throttled progress reporter: emits at most once per `interval` seconds.
+
+    Designed for wiring into HfDownloader's `progress_cb`. The first .update()
+    primes the clock without emitting; subsequent calls emit only when the
+    interval has elapsed since the last emit.
+    """
+
+    def __init__(
+        self,
+        emit: Callable[[str], None],
+        path: str,
+        total: int,
+        interval: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._emit = emit
+        self._path = path
+        self._total = total
+        self._interval = interval
+        self._clock = clock
+        self._last = clock()
+
+    def update(self, transferred: int) -> None:
+        now = self._clock()
+        if now - self._last < self._interval:
+            return
+        self._last = now
+        pct = int(100 * transferred / self._total) if self._total > 0 else 0
+        self._emit(f"{self._path}: {pct}% ({fmt_bytes(transferred)} / {fmt_bytes(self._total)})")
