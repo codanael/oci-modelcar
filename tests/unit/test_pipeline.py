@@ -67,6 +67,47 @@ def _build_worker(tmp_path: Path, head_blob_returns=None, **overrides):
     )
 
 
+def test_file_worker_emits_per_file_log_lines(tmp_path, capsys):
+    """When wired with a PipelineLogger, FileWorker announces start + end of
+    each file's pipeline; download is given a progress_cb that emits via the
+    same logger."""
+    worker, downloader, _head_blob_mock, _streaming = _build_worker(
+        tmp_path, head_blob_returns=None
+    )
+    plog = PipelineLogger(log_style="text", verbose=False, quiet=False)
+    worker.plog = plog
+
+    f = HfFile(path="weights.bin", size=2_000_000, lfs_sha256=None)
+    worker.process(repo="repo", revision="main", hf_file=f)
+
+    out = capsys.readouterr().out
+    # Start line names the file and its size in human bytes.
+    assert "weights.bin" in out
+    assert "2.0 MB" in out
+    # End line announces the pushed digest (short form).
+    assert "pushed" in out.lower() or "uploaded" in out.lower()
+
+    # downloader was given a progress callback (kwarg or positional).
+    kwargs = downloader.download.call_args.kwargs
+    assert kwargs.get("progress_cb") is not None
+
+
+def test_file_worker_logs_reuse_when_head_finds_existing_blob(tmp_path, capsys):
+    """When the skip-check after tar build finds the blob already present,
+    the worker logs a 'reusing' line instead of a 'pushed' one."""
+    worker, _downloader, head_blob_mock, streaming = _build_worker(tmp_path, head_blob_returns=None)
+    head_blob_mock.side_effect = [{"digest": "sha256:dummy", "size": 500}]
+    plog = PipelineLogger(log_style="text", verbose=False, quiet=False)
+    worker.plog = plog
+
+    f = HfFile(path="weights.bin", size=500, lfs_sha256=None)
+    worker.process(repo="repo", revision="main", hf_file=f)
+
+    out = capsys.readouterr().out
+    streaming.push_from_file.assert_not_called()
+    assert ("reusing" in out.lower()) or ("already" in out.lower())
+
+
 def test_file_worker_phase_order_happy_path(tmp_path):
     """Confirms phases a→f run in order: download, tar+hash, head-skip,
     push, verify, cleanup."""

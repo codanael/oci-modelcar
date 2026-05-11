@@ -17,7 +17,7 @@ from oci_modelcar.config import Config
 from oci_modelcar.download import HfDownloader, HfFile
 from oci_modelcar.errors import ConfigError, DiskSpaceError, PartialFailureError, PushError
 from oci_modelcar.layer import build_layer_to_file, tar_layer_size
-from oci_modelcar.logging import PipelineLogger
+from oci_modelcar.logging import PipelineLogger, ProgressEmitter, fmt_bytes
 from oci_modelcar.manifest import (
     ML_MAN,
     ML_TAR,
@@ -53,6 +53,8 @@ class FileWorker:
         oci_max_retries: int,
         backoff_initial: float = 1.0,
         stop_event: threading.Event | None = None,
+        plog: PipelineLogger | None = None,
+        progress_interval: float = 5.0,
     ) -> None:
         self.downloader = downloader
         self.registry_client = registry_client
@@ -64,6 +66,12 @@ class FileWorker:
         self.oci_max_retries = oci_max_retries
         self.backoff_initial = backoff_initial
         self.stop_event = stop_event
+        self.plog = plog
+        self.progress_interval = progress_interval
+
+    def _say(self, msg: str) -> None:
+        if self.plog is not None:
+            self.plog.info(msg)
 
     def process(
         self,
@@ -76,6 +84,14 @@ class FileWorker:
             raise InterruptedError(f"worker for {hf_file.path} aborted before start")
 
         # a. DOWNLOAD
+        self._say(f"{hf_file.path}: downloading ({fmt_bytes(hf_file.size)})")
+        if progress_cb is None and self.plog is not None and hf_file.size > 0:
+            progress_cb = ProgressEmitter(
+                emit=self.plog.info,
+                path=hf_file.path,
+                total=hf_file.size,
+                interval=self.progress_interval,
+            ).update
         source_path = self.downloader.download(repo, revision, hf_file, progress_cb=progress_cb)
 
         # b. TAR + HASH
@@ -92,7 +108,7 @@ class FileWorker:
             target_repo = self._target_repo()
             existing = self.head_blob_fn(self.registry_client, target_repo, digest)
             if existing is not None:
-                log.info("skip push: blob %s already in registry", digest[:23])
+                self._say(f"{hf_file.path}: reusing existing blob {digest[:19]} (skip push)")
                 return BlobDescriptor(
                     media_type=ML_TAR,
                     digest=digest,
@@ -101,6 +117,7 @@ class FileWorker:
                 )
 
             # d. PUSH
+            self._say(f"{hf_file.path}: pushing layer {digest[:19]} ({fmt_bytes(layer_size)})")
             streaming = self.streaming_factory(
                 client=self.registry_client,
                 repo=target_repo,
@@ -118,6 +135,7 @@ class FileWorker:
                     hint="registry may not have persisted the upload; retry the run.",
                 )
 
+            self._say(f"{hf_file.path}: pushed {digest[:19]}")
             return BlobDescriptor(
                 media_type=ML_TAR, digest=digest, size=layer_size, hf_path=hf_file.path
             )
@@ -273,6 +291,7 @@ class Pipeline:
                 clean_hf_after_push=self.cfg.clean_hf_after_push,
                 oci_max_retries=self.cfg.oci_max_retries,
                 stop_event=stop_event,
+                plog=self.plog,
             )
 
         descriptors: list[BlobDescriptor] = []
