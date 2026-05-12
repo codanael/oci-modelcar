@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.2] - 2026-05-12
+
+### Fixed
+- **`tar size mismatch` on files >= 8 GiB.** `tar_layer_size` in
+  `src/oci_modelcar/layer.py` did not account for the PAX extended `size`
+  header that Python's `tarfile` inserts whenever a member is `>= 2**33`
+  bytes (the ustar size field maxes out at 11 octal digits = 8 GiB). PAX
+  prepends two extra 512 B blocks (one `x`-type header + one block of PAX
+  data containing `size=<N>\n`), so for files crossing the threshold the
+  formula under-counted by 1024 B. Whenever that 1024 B happened to push
+  the total across a `RECORDSIZE` (10240 B) boundary — i.e. when
+  `(body_padded + 1536) mod 10240` was `0` or `>= 9217` (~10% of sizes) —
+  the runtime check in `build_layer_to_file` raised
+  `RuntimeError: tar size mismatch`. Hit in the wild with Mistral Medium
+  3.5 (model shards of ~34 GB each); not hit before because typical HF
+  sharding produces ~4-5 GB files. The fix adds the missing 1024 B of
+  PAX overhead in `tar_layer_size` when `file_size >= 2**33`.
+  Regression guard:
+  `tests/unit/test_layer.py:test_tar_layer_size_accounts_for_pax_extended_size_header`,
+  parametrized over the threshold (`2**33 - 1`, `2**33`, `2**33 + 1`,
+  ...) and the exact Mistral M3.5 case.
+
 ## [1.2.1] - 2026-05-12
 
 ### Added
