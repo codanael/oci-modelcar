@@ -11,13 +11,22 @@ from typing import cast
 
 _TAR_BLOCKSIZE = 512
 _TAR_RECORDSIZE = 10240
+# Python's tarfile inserts a PAX extended 'size' header when file_size >= 2**33,
+# because 8 GiB no longer fits in the 11-octal-digit ustar size field. The PAX
+# prefix is one 'x'-type header block plus one block of PAX data ("size=<N>\n"
+# always fits in 512 B for any practical N), so the overhead is exactly 1024 B.
+_PAX_SIZE_THRESHOLD = 2**33
 
 
 def tar_layer_size(file_size: int) -> int:
     """Exact bytes produced by build_layer_tar_bytes / build_layer_to_file
-    for the given file size. Deterministic given mtime=0/uid=0/gid=0."""
+    for the given file size. Deterministic given mtime=0/uid=0/gid=0 and a
+    name that fits the ustar header (< 100 chars)."""
+    header = _TAR_BLOCKSIZE
+    if file_size >= _PAX_SIZE_THRESHOLD:
+        header += 2 * _TAR_BLOCKSIZE
     body_padded = (file_size + _TAR_BLOCKSIZE - 1) // _TAR_BLOCKSIZE * _TAR_BLOCKSIZE
-    raw = _TAR_BLOCKSIZE + body_padded + 2 * _TAR_BLOCKSIZE  # header + body + 2-block trailer
+    raw = header + body_padded + 2 * _TAR_BLOCKSIZE  # header(s) + body + 2-block trailer
     return (raw + _TAR_RECORDSIZE - 1) // _TAR_RECORDSIZE * _TAR_RECORDSIZE
 
 
