@@ -4,7 +4,12 @@ import tarfile
 
 import pytest
 
-from oci_modelcar.layer import build_layer_tar_bytes, build_layer_to_file, tar_layer_size
+from oci_modelcar.layer import (
+    build_layer_tar_bytes,
+    build_layer_to_file,
+    make_tar_info,
+    tar_layer_size,
+)
 
 
 @pytest.mark.parametrize("file_size", [0, 1, 100, 511, 512, 513, 1024, 1025, 12345, 1048576])
@@ -14,6 +19,35 @@ def test_tar_layer_size_matches_actual_bytes(file_size: int):
     registry hangs waiting for missing bytes."""
     actual = len(build_layer_tar_bytes("models/", "weights.bin", b"x" * file_size))
     assert tar_layer_size(file_size) == actual
+
+
+@pytest.mark.parametrize(
+    "file_size",
+    [
+        2**33 - 1,  # last ustar-fitting size: no PAX
+        2**33,  # first PAX-triggering size: alignment puts mismatch at +10240
+        2**33 + 1,  # PAX with body not aligned to 512
+        2**33 + 511,
+        2**33 + 512,
+        34_025_419_000,  # Mistral Medium 3.5 shard — real-world regression case
+    ],
+)
+def test_tar_layer_size_accounts_for_pax_extended_size_header(file_size: int):
+    """Files >= 2**33 bytes (8 GiB) trigger a PAX extended 'size' header.
+
+    Python tarfile prepends one 512 B 'x'-type header and one 512 B PAX data
+    block before the ustar header. The formula must include that 1024 B of
+    overhead, otherwise build_layer_to_file raises 'tar size mismatch' on
+    real-world >8 GiB shards (e.g., Mistral Medium 3.5's 34 GB safetensors).
+    """
+    info = make_tar_info("models/", "weights.safetensors", file_size)
+    header = info.tobuf(tarfile.PAX_FORMAT, encoding="utf-8", errors="surrogateescape")
+    block = 512
+    record = 10240
+    body_padded = ((file_size + block - 1) // block) * block
+    raw = len(header) + body_padded + 2 * block  # header(s) + body + 2-block trailer
+    expected = ((raw + record - 1) // record) * record
+    assert tar_layer_size(file_size) == expected
 
 
 def test_build_layer_to_file_writes_tar_and_returns_digest(tmp_path):
