@@ -127,7 +127,7 @@ def test_ignore_patterns_drops_one_weight_set(tmp_path: Path, monkeypatch) -> No
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             pass
 
-        def push_from_file(self, path: Path, size: int, digest: str) -> None:
+        def push_from_file(self, path: Path, size: int, digest: str, progress_cb=None) -> None:  # type: ignore[no-untyped-def]
             registry.put_blob(digest, size)
             pushed_blobs.append(digest)
 
@@ -226,7 +226,7 @@ def test_filtering_manifest_digest_is_deterministic(tmp_path: Path, monkeypatch)
             def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
                 pass
 
-            def push_from_file(self, path: Path, size: int, digest: str) -> None:
+            def push_from_file(self, path: Path, size: int, digest: str, progress_cb=None) -> None:  # type: ignore[no-untyped-def]
                 registry.put_blob(digest, size)
 
         def fake_head_blob(client, repo, digest):  # type: ignore[no-untyped-def]

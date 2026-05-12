@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Per-file upload progress.** Each layer push now emits the same
+  `<path>: NN% (<x> / <y>)` lines the download phase produces, throttled
+  to one line per 5 s by the existing `ProgressEmitter`. Wired through
+  a new `progress_cb` kwarg on `StreamingBlobUpload.push_from_file`,
+  driven by a small `_ProgressReader` wrapper that ticks on every
+  `read()` requests makes off the body file-like during the PATCH.
+  Symptom this fixes: a multi-GB blob crawling out over a slow registry
+  uplink was indistinguishable from a hung pipeline — only "pushing
+  layer (5 GB)" then nothing until the PUT close completed minutes
+  later. `FileWorker.process` now spins one `ProgressEmitter` per
+  phase (download + push) per file. Disambiguation between the two
+  comes from the surrounding `downloading (...)` / `pushing layer ...`
+  context lines.
+
+### Fixed
+- **Progress lines now appear for fast-finishing downloads.**
+  `ProgressEmitter` used to prime `_last` to `clock()` in `__init__`,
+  swallowing the only signal a sub-`interval` (< 5 s) download produced:
+  every per-chunk `update()` fell inside the throttle window and nothing
+  printed. For a 50 GB push sharded into ~10 files of ~5 GB on a fast
+  CDN, the user saw `downloading (5 GB)` followed by minutes of silence.
+  `_last` is now seeded to `float("-inf")` so the first `update()`
+  always emits; subsequent calls remain throttled. A dedicated
+  regression test (`test_progress_emitter_emits_at_least_once_for_fast_downloads`)
+  pins the new behavior.
+
 ## [1.2.0] - 2026-05-11
 
 ### Added

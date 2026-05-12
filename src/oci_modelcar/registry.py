@@ -8,7 +8,9 @@ import logging
 import random
 import threading
 import time
+from collections.abc import Callable
 from functools import cached_property
+from io import BufferedReader
 from pathlib import Path
 
 import requests
@@ -130,6 +132,38 @@ def validate_manifest_tag(client: OciClient, repo: str, tag: str, expected_diges
         )
 
 
+class _ProgressReader:
+    """Wraps a binary stream so requests' file-like read loop drives
+    ``progress_cb`` after each chunk and ``stop_event`` is polled at the
+    same cadence as the upload itself.
+
+    Kept private to ``registry.py``: it has no Content-Length / seek
+    semantics because the caller pins ``Content-Length`` in headers
+    explicitly (so requests won't try to size the body itself).
+    """
+
+    def __init__(
+        self,
+        stream: BufferedReader,
+        progress_cb: Callable[[int], None] | None,
+        stop_event: threading.Event | None,
+    ) -> None:
+        self._stream = stream
+        self._cb = progress_cb
+        self._stop = stop_event
+        self._sent = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if self._stop is not None and self._stop.is_set():
+            raise InterruptedError("OCI PATCH aborted by stop_event")
+        chunk = self._stream.read(size)
+        if chunk:
+            self._sent += len(chunk)
+            if self._cb is not None:
+                self._cb(self._sent)
+        return chunk
+
+
 class StreamingBlobUpload:
     """Single-PATCH streaming blob upload, body sourced from a local file.
 
@@ -165,10 +199,20 @@ class StreamingBlobUpload:
             raise RuntimeError("upload init missing Location header")
         return _resolve_upload_location(self.client, loc)
 
-    def push_from_file(self, tar_path: Path, total_size: int, digest: str) -> tuple[str, int]:
+    def push_from_file(
+        self,
+        tar_path: Path,
+        total_size: int,
+        digest: str,
+        progress_cb: Callable[[int], None] | None = None,
+    ) -> tuple[str, int]:
         """POST init → PATCH from file (full replay on cut) → PUT close.
 
-        Each retry attempt re-opens tar_path and rewinds to offset 0.
+        Each retry attempt re-opens tar_path and rewinds to offset 0; the
+        per-attempt progress counter restarts at 0 (the wire really does
+        re-send from offset 0). Caller-side throttlers (ProgressEmitter)
+        should be fine with that — they just see a new ramp.
+
         Backoff: full jitter Uniform(0, min(cap, base * 2^attempt)).
         Accepts {200, 201, 202, 204} on PATCH (Artifactory + Harbor quirks).
         """
@@ -192,7 +236,8 @@ class StreamingBlobUpload:
                 # containers/image behavior; cost is one POST round-trip per retry,
                 # which is negligible compared to the file body re-upload.
                 location = self._begin()
-                with open(tar_path, "rb") as body:
+                with open(tar_path, "rb") as raw:
+                    body = _ProgressReader(raw, progress_cb, self.stop_event)
                     hdr = {
                         **self.client.auth,
                         "Content-Type": "application/octet-stream",
