@@ -114,7 +114,7 @@ def test_repush_unchanged_model_reuses_all_layers(tmp_path: Path, monkeypatch) -
         def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
             pass
 
-        def push_from_file(self, path: Path, size: int, digest: str) -> None:
+        def push_from_file(self, path: Path, size: int, digest: str, progress_cb=None) -> None:  # type: ignore[no-untyped-def]
             registry.put_blob(digest, size)
             pushed_blobs.append(digest)
 

@@ -215,6 +215,39 @@ def test_streaming_push_from_file_happy_path(tmp_path: Path):
     assert bytes(received) == payload
 
 
+def test_streaming_push_from_file_invokes_progress_cb(tmp_path: Path):
+    """A multi-chunk body must drive progress_cb monotonically up to total_size."""
+    payload = b"P" * (4 * 1024 * 1024 + 3)  # > one read() call's worth
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    f = tmp_path / "layer.tar"
+    f.write_bytes(payload)
+
+    fake_session = MagicMock()
+    fake_session.post.return_value = _make_response(202, {"Location": "http://test/u/p"})
+
+    def patch_handler(*args: object, **kwargs: object) -> MagicMock:
+        # Emulate requests' file-like consumption: chunked read() until EOF.
+        data = kwargs["data"]
+        while True:
+            chunk = data.read(256 * 1024)  # type: ignore[union-attr]
+            if not chunk:
+                break
+        return _make_response(202, {"Location": "http://test/u/p"})
+
+    fake_session.patch.side_effect = patch_handler
+    fake_session.put.return_value = _make_response(201)
+
+    progress: list[int] = []
+    upload = StreamingBlobUpload(client=_make_client(fake_session), repo="repo")
+    upload.push_from_file(f, len(payload), digest, progress_cb=progress.append)
+
+    assert progress, "progress_cb was never invoked during PATCH"
+    assert progress == sorted(progress), "progress_cb values must be monotonically non-decreasing"
+    assert progress[-1] == len(payload), (
+        f"final progress {progress[-1]} should equal payload size {len(payload)}"
+    )
+
+
 @pytest.mark.parametrize("success_status", [200, 201, 202, 204])
 def test_streaming_accepts_non_spec_success_codes(tmp_path: Path, success_status: int):
     """Artifactory returns 200/204; Harbor (some setups) returns 204.

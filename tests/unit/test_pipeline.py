@@ -146,6 +146,14 @@ def test_file_worker_emits_per_file_log_lines(tmp_path, capsys):
     # End line announces the pushed digest (short form).
     assert "pushed" in out.lower() or "uploaded" in out.lower()
 
+    # streaming.push_from_file was given a progress callback (regression guard
+    # for upload-side visibility — see CLAUDE.md "Locked design decisions").
+    push_kwargs = _streaming.push_from_file.call_args.kwargs
+    assert push_kwargs.get("progress_cb") is not None, (
+        "FileWorker must wire a progress_cb into push_from_file so the "
+        "upload phase emits progress lines like the download phase does"
+    )
+
     # downloader was given a progress callback (kwarg or positional).
     kwargs = downloader.download.call_args.kwargs
     assert kwargs.get("progress_cb") is not None

@@ -183,6 +183,26 @@ explaining why in the PR.
 - **`derive_tag` lives in `manifest.py`** (migrated from the removed `tags.py`).
   40-char SHA → first 12 chars; other revision strings are sanitized.
   Don't split it out again.
+- **`ProgressEmitter` emits on the FIRST `update()` call** (`logging.py`).
+  `self._last` is seeded to `float("-inf")`, not `clock()`. Reason: HF
+  shards a 50 GB push into ~10 files of ~5 GB; on a fast CDN each shard
+  completes in <5 s, so seeding `_last` to "now" makes every per-chunk
+  check fall inside the throttle window and the only signal is swallowed.
+  The visible symptom is "downloading (5 GB)" then total silence for
+  minutes. Do NOT reintroduce a "prime the clock on the first call"
+  pattern — `tests/unit/test_logging.py:test_progress_emitter_emits_at_least_once_for_fast_downloads`
+  is the regression guard.
+- **Both download AND push emit per-chunk progress via a `progress_cb`.**
+  `download.py:_stream_one_attempt` ticks on each `iter_content` chunk;
+  `registry.py:StreamingBlobUpload.push_from_file` ticks on each
+  `_ProgressReader.read()` requests makes during PATCH. Both end up in
+  the same `PipelineLogger` via two `ProgressEmitter` instances per
+  file, sharing format `<path>: NN% (<x> / <y>)`. Disambiguation comes
+  from the surrounding `downloading (...)` / `pushing layer ...`
+  context lines, NOT from the percent line itself. Do not collapse
+  progress to download-only — a slow registry uplink looks indistinguishable
+  from a hung pipeline without it. `tests/unit/test_pipeline.py:test_file_worker_emits_per_file_log_lines`
+  asserts the push-side `progress_cb` is wired (regression guard).
 
 ## NixOS-specific gotchas
 

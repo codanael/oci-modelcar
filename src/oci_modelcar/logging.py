@@ -105,8 +105,8 @@ class ProgressEmitter:
     """Throttled progress reporter: emits at most once per `interval` seconds.
 
     Designed for wiring into HfDownloader's `progress_cb`. The first .update()
-    primes the clock without emitting; subsequent calls emit only when the
-    interval has elapsed since the last emit.
+    emits immediately so a fast download (< interval) still logs at least one
+    line; subsequent calls are throttled to one emit per `interval`.
     """
 
     def __init__(
@@ -122,7 +122,8 @@ class ProgressEmitter:
         self._total = total
         self._interval = interval
         self._clock = clock
-        self._last = clock()
+        # Sentinel: -inf forces the first update() past the throttle.
+        self._last = float("-inf")
 
     def update(self, transferred: int) -> None:
         now = self._clock()

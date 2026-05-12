@@ -104,7 +104,7 @@ def test_fmt_bytes_scales_units():
 
 
 def test_progress_emitter_throttles_to_interval():
-    """Emits only when at least `interval` seconds elapsed since the last emit."""
+    """First update emits immediately; subsequent updates throttle by `interval`."""
     out: list[str] = []
     fake_now = [0.0]
     emit = ProgressEmitter(
@@ -114,23 +114,50 @@ def test_progress_emitter_throttles_to_interval():
         interval=5.0,
         clock=lambda: fake_now[0],
     )
-    # First call at t=0 — primes _last; should not emit yet.
+    # First call at t=0 — emits immediately so very-fast downloads still log.
     emit.update(100)
-    assert out == []
-    # Still within interval — no emit.
+    assert len(out) == 1
+    assert "10%" in out[0]
+    # Within interval — throttled.
     fake_now[0] = 4.0
     emit.update(400)
-    assert out == []
-    # Past interval — one emit.
+    assert len(out) == 1
+    # Past interval — second emit.
     fake_now[0] = 6.0
     emit.update(600)
-    assert len(out) == 1
-    assert "model.safetensors" in out[0]
-    assert "60" in out[0]  # percent
-    # Next call right after — throttled.
+    assert len(out) == 2
+    assert "60" in out[1]
+    # Next call right after — throttled again.
     fake_now[0] = 7.0
     emit.update(700)
-    assert len(out) == 1
+    assert len(out) == 2
+
+
+def test_progress_emitter_emits_at_least_once_for_fast_downloads():
+    """Regression guard: a file that finishes in under `interval` seconds must
+    still emit at least one progress line.
+
+    An earlier implementation primed ``_last`` to ``clock()`` in ``__init__``,
+    which swallowed the only signal a fast download produced: every chunk
+    fell inside the throttle window and nothing was ever printed. For a
+    multi-shard push against a fast CDN that looked like total silence
+    between the ``downloading`` and ``pushing`` lines.
+    """
+    out: list[str] = []
+    fake_now = [0.0]
+    emit = ProgressEmitter(
+        emit=out.append,
+        path="big.safetensors",
+        total=5_000_000_000,
+        interval=5.0,
+        clock=lambda: fake_now[0],
+    )
+    # Simulate a download whose chunks all arrive within < interval seconds.
+    for now, transferred in [(0.05, 100_000_000), (1.5, 2_500_000_000), (3.0, 5_000_000_000)]:
+        fake_now[0] = now
+        emit.update(transferred)
+    assert len(out) >= 1, "fast-finishing downloads must emit at least one progress line"
+    assert "big.safetensors" in out[0]
 
 
 def test_progress_emitter_formats_human_bytes():
@@ -146,10 +173,12 @@ def test_progress_emitter_formats_human_bytes():
     emit.update(0)
     fake_now[0] = 2.0
     emit.update(1_000_000_000)
-    assert len(out) == 1
-    assert "1.00 GB" in out[0]
-    assert "2.00 GB" in out[0]
-    assert "50%" in out[0]
+    # First call emits immediately (0%), second past interval (50%).
+    assert len(out) == 2
+    assert "0%" in out[0]
+    assert "1.00 GB" in out[1]
+    assert "2.00 GB" in out[1]
+    assert "50%" in out[1]
 
 
 def test_progress_emitter_zero_total_does_not_divide():

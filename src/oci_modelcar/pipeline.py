@@ -151,7 +151,15 @@ class FileWorker:
                 backoff_initial=self.backoff_initial,
                 stop_event=self.stop_event,
             )
-            streaming.push_from_file(tar_path, layer_size, digest)
+            push_progress = None
+            if self.plog is not None and layer_size > 0:
+                push_progress = ProgressEmitter(
+                    emit=self.plog.info,
+                    path=hf_file.path,
+                    total=layer_size,
+                    interval=self.progress_interval,
+                ).update
+            streaming.push_from_file(tar_path, layer_size, digest, progress_cb=push_progress)
 
             # e. VERIFY
             verified = self.head_blob_fn(self.registry_client, target_repo, digest)
