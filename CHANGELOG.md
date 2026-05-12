@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.2.1] - 2026-05-12
 
 ### Added
 - **Per-file upload progress.** Each layer push now emits the same
@@ -30,6 +30,9 @@ All notable changes to this project will be documented in this file.
   always emits; subsequent calls remain throttled. A dedicated
   regression test (`test_progress_emitter_emits_at_least_once_for_fast_downloads`)
   pins the new behavior.
+- **`src/oci_modelcar/__init__.py:__version__` resynced.** The string
+  was left at `"1.1.0"` during the v1.2.0 release; bumped to `"1.2.1"`
+  alongside the `pyproject.toml` version field.
 
 ## [1.2.0] - 2026-05-11
 
