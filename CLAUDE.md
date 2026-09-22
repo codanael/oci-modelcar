@@ -7,7 +7,7 @@ Guidance for AI assistants and future Claude sessions working on this repo.
 `oci-modelcar` — a Python CLI that pushes HuggingFace models to OCI registries
 as multi-layer images, suitable for KServe with native OCI image volumes
 (KEP-4639). Public package on PyPI, MIT licensed. Repo:
-`github.com/codanael/oci-modelcar`. Latest released: v1.0.0.
+`github.com/codanael/oci-modelcar`. Latest released: v1.2.3.
 
 ## Read in this order
 

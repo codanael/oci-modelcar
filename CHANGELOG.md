@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.2.3] - 2026-09-22
 
 ### Fixed
 - **Nested HF files were flattened to their basename inside the image.**
