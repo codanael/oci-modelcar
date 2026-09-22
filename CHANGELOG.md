@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **`--dry-run` wrote to the registry.** Since v1.2.0 the referrer-reuse
+  pre-flight PUT the anchor manifest and its empty-config blob before the
+  dry-run early return, so a dry run left two blobs and a manifest behind.
+  The anchor write is now skipped under `--dry-run`; the read-only lookup
+  of existing reuse records still runs (a missing anchor is a plain 404).
+  The nightly e2e `test_gap_d_dry_run.py` had been failing on this since
+  the feature landed. Regression guard:
+  `tests/unit/test_pipeline.py:test_pipeline_dry_run_does_not_write_anchor`.
+
 ## [1.2.3] - 2026-09-22
 
 ### Fixed

@@ -372,7 +372,10 @@ class Pipeline:
             anchor_digest = "sha256:" + hashlib.sha256(anchor_bytes).hexdigest()
             anchor_size = len(anchor_bytes)
             if not self.cfg.force:
-                self._reuse_store.ensure_anchor(anchor_bytes, anchor_digest)
+                # dry-run must not write to the registry; reading records
+                # for a not-yet-existing anchor is a harmless 404.
+                if not self.cfg.dry_run:
+                    self._reuse_store.ensure_anchor(anchor_bytes, anchor_digest)
                 referrer_reuse_map = self._reuse_store.load_reuse_map(anchor_digest)
                 if referrer_reuse_map:
                     self.plog.info(

@@ -721,3 +721,35 @@ def test_file_worker_tar_entry_preserves_hf_subdirectory(tmp_path):
     worker.process(repo="repo", revision="main", hf_file=f)
 
     assert captured == ["models/onnx/config.json"]
+
+
+def test_pipeline_dry_run_does_not_write_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run promises zero registry writes. The v1.3 referrer anchor is
+    PUT (plus its empty-config blob) during pre-flight, before the dry-run
+    return, so it must be skipped explicitly."""
+    cfg, plog = _build_pipeline(tmp_path, dry_run=True)
+    fake_downloader = MagicMock()
+    fake_downloader.resolve_revision.return_value = "deadbeef" * 5
+    fake_downloader.list_files.return_value = [HfFile("a.bin", 100, None)]
+    reuse_store = MagicMock()
+    reuse_store.load_reuse_map.return_value = {}
+    monkeypatch.setattr(
+        "oci_modelcar.pipeline.shutil.disk_usage",
+        lambda p: type("DU", (), {"free": 100 * 1024**3})(),
+    )
+    monkeypatch.setattr("oci_modelcar.pipeline.get_manifest_digest_at_tag", lambda *a, **kw: None)
+
+    pipeline = Pipeline(
+        cfg,
+        plog,
+        downloader=fake_downloader,
+        registry_client=MagicMock(target_repo="models/x"),
+        reuse_store=reuse_store,
+    )
+    result = pipeline.run()
+
+    assert result.manifest_digest == ""
+    reuse_store.ensure_anchor.assert_not_called()
+    reuse_store.record.assert_not_called()
