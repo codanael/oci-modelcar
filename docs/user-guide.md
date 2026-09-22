@@ -623,8 +623,9 @@ spec:
 Use the digest reference (`@sha256:...`) rather than a mutable tag for
 reproducible deployments.
 
-The model files appear under `/mnt/models/<layer-prefix>/<filename>`
-inside the predictor pod. The default `--layer-prefix models/` puts
+The model files appear under `/mnt/models/<layer-prefix>/<hf-path>`
+inside the predictor pod, keeping any subdirectories from the HF repo
+(so `onnx/config.json` lands at `/mnt/models/models/onnx/config.json`). The default `--layer-prefix models/` puts
 them at `/mnt/models/models/...`; override to `--layer-prefix ""` if
 your serving framework expects them at the volume root.
 

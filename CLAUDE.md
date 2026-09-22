@@ -58,16 +58,26 @@ Module dependency graph is acyclic. Wiring lives only in `pipeline.py` and
 ## Dev environment (NixOS)
 
 A `shell.nix` exists at the repo root but is **gitignored**. It provisions
-Python 3.14, ruff, mypy, pre-commit, skopeo, gh, git. Always run commands via:
+Python 3.14, ruff, skopeo, gh, git (mypy and pre-commit come from the venv). Always run commands via:
 
 ```bash
 nix-shell ./shell.nix --command "<command>"
 ```
 
 The `shellHook` auto-creates `.venv/`, runs `pip install -e '.[dev,e2e]'`, and
-runs `pre-commit install`. It also forces nix-installed `ruff`/`mypy` ahead of
-venv copies in `PATH` because pip-installed ruff is a glibc-linked binary that
-won't run on NixOS.
+runs `pre-commit install`. It also forces nix-installed `ruff` ahead of the
+venv copy in `PATH` because pip-installed ruff is a glibc-linked binary that
+won't run on NixOS. `mypy` and `pre-commit` come from the venv (pip wheels
+load fine under the nix interpreter).
+
+Two traps when recreating `shell.nix`: `mkShell` exports the nix Python
+packages on `PYTHONPATH`, which shadows the venv and makes pip skip
+installing `pytest`/`mypy` — `unset PYTHONPATH NIX_PYTHONPATH` at the top of
+the `shellHook`. And don't put `pkgs.pre-commit`/`pkgs.mypy` in `packages`:
+the nix pre-commit wrapper rewrites `PATH` for hooks so `python3.14 -m ...`
+resolves to the bare nix interpreter, and the hooks fail with
+"No module named pytest". If that already happened, `pre-commit install -f`
+from inside the venv regenerates `.git/hooks/pre-commit`.
 
 If `shell.nix` is missing on a fresh checkout, recreate it from the design spec
 §13 or copy from another dev's machine — it's not in git on purpose.
@@ -119,6 +129,16 @@ explaining why in the PR.
   identical manifest digest. Adding `created` breaks idempotence.
 - **mtime=0, uid=gid=0, uname=gname=""** in all tar headers
   (`layer.py:make_tar_info`). Reproducibility.
+- **Tar entry name is `<layer_prefix><hf_path>`, the full HF path**
+  (`pipeline.py:FileWorker.process` passes `hf_file.path`, not its
+  basename). Root and nested files sharing a basename (`config.json` vs
+  `onnx/config.json`) must not collide inside the image. Regression guard:
+  `tests/unit/test_pipeline.py:test_file_worker_tar_entry_preserves_hf_subdirectory`.
+- **`tar_layer_size(file_size, name)` measures the header by serialising
+  the real `TarInfo`** rather than modelling PAX overhead by hand. Long
+  names (> 100 chars) and sizes >= 8 GiB both trigger PAX headers; both
+  callers (`build_layer_to_file` self-check and the disk pre-flight) must
+  pass the real entry name.
 - **Single PATCH per blob from local spool file (Jib-style replay-on-cut).**
   `registry.py:SinglePatchUpload` issues one PATCH with upfront `Content-Length`.
   On failure the full PATCH is replayed from the spool file. This eliminates

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Nested HF files were flattened to their basename inside the image.**
+  `FileWorker` passed `hf_file.path.split("/")[-1]` to the layer builder,
+  so `config.json` and `onnx/config.json` both produced a tar entry named
+  `models/config.json`; on unpack the later layer silently overwrote the
+  earlier one and the HF folder structure was lost. Layer entries are now
+  named `<layer-prefix><hf_path>`, mirroring the HF repo layout. Images
+  pushed by earlier versions keep the flattened layout until re-pushed
+  with `--force`: a plain re-push either finds the tag already present and
+  exits, or reuses the old layers through their annotations. `--force`
+  rebuilds and uploads every layer. Regression guard:
+  `tests/unit/test_pipeline.py:test_file_worker_tar_entry_preserves_hf_subdirectory`.
+- **`tar size mismatch` on entry names longer than 100 chars.** Full
+  paths can exceed the ustar name field, at which point `tarfile` emits a
+  PAX `path` header the hand-rolled size formula did not include.
+  `tar_layer_size` now takes the entry name and measures the header by
+  serialising the real `TarInfo`, covering both the PAX `size` (>= 8 GiB)
+  and PAX `path` cases with one rule. Regression guard:
+  `tests/unit/test_layer.py:test_build_layer_to_file_handles_names_longer_than_ustar_limit`.
+
 ## [1.2.2] - 2026-05-12
 
 ### Fixed

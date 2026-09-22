@@ -126,6 +126,8 @@ is the right vehicle.
 │     LayerBuilder.build_to_file(source_path, prefix, dest)        │
 │     - Build deterministic tar at <spool>/layers/<hf_path>.tar    │
 │       (mtime=0, uid=gid=0, uname=gname="")                       │
+│     - Single member named <prefix><hf_path> (full HF path, so    │
+│       root/nested files with equal basenames never collide)      │
 │     - sha256 incremental during write                            │
 │     → (tar_path, digest, layer_size)                             │
 │                                                                  │
