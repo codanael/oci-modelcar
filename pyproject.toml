@@ -60,6 +60,9 @@ packages = ["src/oci_modelcar"]
 target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
+# ruff >= 0.16 formats Python code blocks inside Markdown; the design/plan
+# docs hold illustrative snippets that are not meant to be formatter-clean.
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
