@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from oci_modelcar import __version__
 from oci_modelcar.cli import main
 
 
@@ -28,7 +29,24 @@ def test_cli_top_level_help_exits_zero(flag, capsys):
     assert "usage:" in out.out
     assert "{push,status,validate}" in out.out
     assert "push --help" in out.out
+    assert "--version" in out.out
     assert out.err == ""
+
+
+def test_cli_top_level_version_exits_zero(capsys):
+    rc = main(["oci-modelcar", "--version"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out == f"oci-modelcar {__version__}\n"
+    assert out.err == ""
+
+
+def test_cli_version_does_not_hardcode_number(capsys, monkeypatch):
+    monkeypatch.setattr("oci_modelcar.cli.__version__", "9.9.9-test")
+    rc = main(["oci-modelcar", "--version"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert out.out == "oci-modelcar 9.9.9-test\n"
 
 
 def test_cli_push_help_argparse(capsys):

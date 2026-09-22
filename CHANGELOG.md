@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`oci-modelcar --version`.** Top-level option that prints
+  `oci-modelcar <version>` (from `oci_modelcar.__version__`) to stdout and
+  exits 0, alongside the existing `--help`. Also works as
+  `python -m oci_modelcar --version`. The top-level usage line now reads
+  `oci-modelcar [--version] {push,status,validate} [options]`. Regression
+  guard: `tests/unit/test_cli.py:test_cli_top_level_version_exits_zero`.
+
 ### Fixed
 - **`--dry-run` wrote to the registry.** Since v1.2.0 the referrer-reuse
   pre-flight PUT the anchor manifest and its empty-config blob before the

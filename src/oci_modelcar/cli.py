@@ -8,6 +8,7 @@ import sys
 
 from huggingface_hub import HfApi
 
+from oci_modelcar import __version__
 from oci_modelcar.config import Config
 from oci_modelcar.download import HfDownloader
 from oci_modelcar.errors import OciModelcarError, exit_code_for
@@ -19,21 +20,27 @@ from oci_modelcar.reuse import RegistryReuseStore
 
 log = logging.getLogger(__name__)
 
+_USAGE = "usage: oci-modelcar [--version] {push,status,validate} [options]"
+
 
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv
 
     if len(argv) < 2:
-        print("usage: oci-modelcar {push,status,validate} [options]", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
         return 1
 
     sub = argv[1]
     rest = argv[2:]
 
     if sub in ("-h", "--help"):
-        print("usage: oci-modelcar {push,status,validate} [options]")
+        print(_USAGE)
         print("Run 'oci-modelcar push --help' for sub-command flags.")
+        return 0
+
+    if sub == "--version":
+        print(f"oci-modelcar {__version__}")
         return 0
 
     if sub == "push":

@@ -80,9 +80,9 @@ Requires Python 3.11+. The runtime dependencies are `requests`,
 Verify:
 
 ```bash
+oci-modelcar --version     # prints "oci-modelcar <version>"
 oci-modelcar --help        # shows usage
 oci-modelcar push --help   # full flag list
-python -c "import oci_modelcar; print(oci_modelcar.__version__)"
 ```
 
 ---
