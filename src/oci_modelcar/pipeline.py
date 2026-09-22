@@ -331,7 +331,7 @@ class Pipeline:
     def _check_disk_space(self, files: list[HfFile]) -> None:
         if not files:
             return
-        max_layer = max(tar_layer_size(f.size) for f in files)
+        max_layer = max(tar_layer_size(f.size, self.cfg.layer_prefix + f.path) for f in files)
         max_source = max(f.size for f in files)
         total_sources = sum(f.size for f in files)
 

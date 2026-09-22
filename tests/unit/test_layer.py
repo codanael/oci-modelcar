@@ -111,3 +111,26 @@ def test_layer_tar_has_zero_mtime_uid_gid(tmp_path):
         assert m.uid == 0 and m.gid == 0
         assert m.uname == "" and m.gname == ""
         assert m.mode == 0o644
+
+
+def test_build_layer_to_file_handles_names_longer_than_ustar_limit(tmp_path):
+    """Nested HF paths can exceed the 100-char ustar name field. tarfile then
+    emits a PAX 'path' header; the size formula must include it or
+    build_layer_to_file raises 'tar size mismatch'."""
+    long_name = (
+        "checkpoints/" + "very-long-directory-name/" * 4 + "model-00001-of-00009.safetensors"
+    )
+    assert len("models/" + long_name) > 100
+    source = tmp_path / "f.bin"
+    # 8704 + 512 header + 1024 trailer == exactly one 10240 record, so the
+    # extra PAX blocks push the real size into the next record.
+    payload = b"Z" * 8704
+    source.write_bytes(payload)
+    dest = tmp_path / "f.tar"
+
+    _digest, size = build_layer_to_file(source, "models/", long_name, dest)
+
+    assert size == len(dest.read_bytes())
+    assert size == tar_layer_size(len(payload), "models/" + long_name)
+    with tarfile.open(dest, mode="r") as tf:
+        assert [m.name for m in tf.getmembers()] == ["models/" + long_name]

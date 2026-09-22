@@ -11,20 +11,21 @@ from typing import cast
 
 _TAR_BLOCKSIZE = 512
 _TAR_RECORDSIZE = 10240
-# Python's tarfile inserts a PAX extended 'size' header when file_size >= 2**33,
-# because 8 GiB no longer fits in the 11-octal-digit ustar size field. The PAX
-# prefix is one 'x'-type header block plus one block of PAX data ("size=<N>\n"
-# always fits in 512 B for any practical N), so the overhead is exactly 1024 B.
-_PAX_SIZE_THRESHOLD = 2**33
 
 
-def tar_layer_size(file_size: int) -> int:
+def tar_layer_size(file_size: int, name: str = "") -> int:
     """Exact bytes produced by build_layer_tar_bytes / build_layer_to_file
-    for the given file size. Deterministic given mtime=0/uid=0/gid=0 and a
-    name that fits the ustar header (< 100 chars)."""
-    header = _TAR_BLOCKSIZE
-    if file_size >= _PAX_SIZE_THRESHOLD:
-        header += 2 * _TAR_BLOCKSIZE
+    for a member called `name` (prefix + hf_path) of `file_size` bytes.
+
+    The header is measured by serialising the real TarInfo, so PAX extended
+    headers that tarfile adds for sizes >= 8 GiB or names > 100 chars are
+    included automatically instead of being modelled by hand.
+    """
+    header = len(
+        make_tar_info("", name, file_size).tobuf(
+            tarfile.PAX_FORMAT, encoding="utf-8", errors="surrogateescape"
+        )
+    )
     body_padded = (file_size + _TAR_BLOCKSIZE - 1) // _TAR_BLOCKSIZE * _TAR_BLOCKSIZE
     raw = header + body_padded + 2 * _TAR_BLOCKSIZE  # header(s) + body + 2-block trailer
     return (raw + _TAR_RECORDSIZE - 1) // _TAR_RECORDSIZE * _TAR_RECORDSIZE
@@ -93,7 +94,7 @@ def build_layer_to_file(
             with open(source_path, "rb") as src:
                 tar.addfile(info, src)
     digest = "sha256:" + writer.h.hexdigest()
-    expected_size = tar_layer_size(source_size)
+    expected_size = tar_layer_size(source_size, prefix + filename)
     if writer.bytes_written != expected_size:
         raise RuntimeError(
             f"tar size mismatch for {filename}: wrote {writer.bytes_written}, "
