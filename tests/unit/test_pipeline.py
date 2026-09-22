@@ -1,5 +1,6 @@
 """Tests for pipeline.py: FileWorker + Pipeline."""
 
+import tarfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -699,3 +700,24 @@ def test_pipeline_tag_conflict_with_force_overwrites(
     pipeline = Pipeline(cfg, plog, downloader=fake_downloader, registry_client=fake_registry)
     result = pipeline.run()
     assert result.manifest_digest == "sha256:new"  # overwrote existing
+
+
+def test_file_worker_tar_entry_preserves_hf_subdirectory(tmp_path):
+    """A file at 'onnx/config.json' must land at 'models/onnx/config.json'
+    inside the layer, not 'models/config.json'. Flattening to the basename
+    makes root and nested files with the same name overwrite each other
+    when the image is unpacked."""
+    worker, _downloader, _head, streaming = _build_worker(tmp_path, head_blob_returns=None)
+    captured: list[str] = []
+
+    def capture(tar_path, total_size, digest, progress_cb=None):
+        with tarfile.open(tar_path, mode="r") as tf:
+            captured.extend(m.name for m in tf.getmembers())
+        return (digest, total_size)
+
+    streaming.push_from_file.side_effect = capture
+
+    f = HfFile(path="onnx/config.json", size=64, lfs_sha256=None)
+    worker.process(repo="repo", revision="main", hf_file=f)
+
+    assert captured == ["models/onnx/config.json"]

@@ -125,7 +125,7 @@ class FileWorker:
             digest, layer_size = build_layer_to_file(
                 source_path,
                 self.layer_prefix,
-                hf_file.path.split("/")[-1],
+                hf_file.path,
                 tar_path,
             )
 
